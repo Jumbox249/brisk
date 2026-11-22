@@ -25,23 +25,64 @@ sealed partial class AdBlocker : IDisposable
     [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
     private static partial IntPtr brisk_engine_hidden_selectors(IntPtr engine, string classes, string ids, string exceptions);
     [LibraryImport(Lib)] private static partial void brisk_free_string(IntPtr s);
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
+    private static partial int brisk_engine_use_resources(IntPtr engine, string json);
 
     static readonly string[] FilterLists =
     [
         "https://easylist.to/easylist/easylist.txt",
         "https://easylist.to/easylist/easyprivacy.txt",
         "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=adblockplus&mimetype=plaintext",
+        // uBlock Origin's own lists carry the script rules that strip YouTube's video ads.
+        "https://ublockorigin.github.io/uAssets/filters/filters.txt",
+        "https://ublockorigin.github.io/uAssets/filters/quick-fixes.txt",
     ];
 
     static readonly TimeSpan RefreshAfter = TimeSpan.FromDays(4);
     static readonly string CacheDir = Path.Combine(Settings.DataDir, "adblock");
-    static readonly string EnginePath = Path.Combine(CacheDir, "engine.dat");
+    // Bump the name whenever FilterLists changes, so existing installs rebuild with the new lists.
+    static readonly string EnginePath = Path.Combine(CacheDir, "engine-v2.dat");
+    static readonly string ResourcesPath = Path.Combine(CacheDir, "scriptlets.json");
+    static readonly TimeSpan ResourcesRefreshAfter = TimeSpan.FromDays(7);
+
+    /// <summary>Scriptlet resources (see ScriptletConverter), applied to every engine we load.</summary>
+    static string? _resources = ReadResources();
 
     readonly SynchronizationContext _ui;
     IntPtr _engine;
     bool _updating;
 
     public bool IsReady => _engine != IntPtr.Zero;
+
+    /// <summary>True when the scriptlet resources are missing or due for a refresh.</summary>
+    public static bool ResourcesStale =>
+        _resources is null || DateTime.UtcNow - File.GetLastWriteTimeUtc(ResourcesPath) > ResourcesRefreshAfter;
+
+    static string? ReadResources()
+    {
+        try { return File.Exists(ResourcesPath) ? File.ReadAllText(ResourcesPath) : null; }
+        catch (IOException) { return null; }
+    }
+
+    static void ApplyResources(IntPtr engine)
+    {
+        if (engine != IntPtr.Zero && _resources is not null) brisk_engine_use_resources(engine, _resources);
+    }
+
+    /// <summary>Stores freshly converted scriptlet resources and loads them into the live engine (UI thread).</summary>
+    public bool SetResources(string json)
+    {
+        if (_engine != IntPtr.Zero && brisk_engine_use_resources(_engine, json) < 0) return false;
+        _resources = json;
+        try
+        {
+            Directory.CreateDirectory(CacheDir);
+            File.WriteAllText(ResourcesPath + ".tmp", json);
+            File.Move(ResourcesPath + ".tmp", ResourcesPath, overwrite: true);
+        }
+        catch (IOException) { }
+        return true;
+    }
 
     /// <summary>Raised on the UI thread after a filter-list update, with a status message.</summary>
     public event Action<string>? Updated;
@@ -59,6 +100,7 @@ sealed partial class AdBlocker : IDisposable
                 if (File.Exists(EnginePath)) loaded = Deserialize(File.ReadAllBytes(EnginePath));
             }
             catch (IOException) { }
+            ApplyResources(loaded);
 
             if (loaded != IntPtr.Zero) _ui.Post(_ => Swap(loaded), null);
 
@@ -84,6 +126,7 @@ sealed partial class AdBlocker : IDisposable
                 var rules = Encoding.UTF8.GetBytes(string.Join('\n', lists));
 
                 var engine = Build(rules);
+                ApplyResources(engine);
 
                 Directory.CreateDirectory(CacheDir);
                 var tmp = EnginePath + ".tmp";
@@ -132,6 +175,20 @@ sealed partial class AdBlocker : IDisposable
     /// <summary>Site-specific cosmetic rules: JSON with hide_selectors, exceptions and generichide.</summary>
     public string UrlCosmetics(string url) =>
         _engine == IntPtr.Zero ? "{}" : TakeString(brisk_engine_url_cosmetics(_engine, url));
+
+    /// <summary>
+    /// Scriptlet code the filter lists want injected into pages on this URL's host (for example the
+    /// YouTube rules that strip video ads out of player responses), or "" if there is none.
+    /// </summary>
+    public string InjectedScript(string url)
+    {
+        if (_engine == IntPtr.Zero) return "";
+        using var doc = JsonDocument.Parse(TakeString(brisk_engine_url_cosmetics(_engine, url)));
+        return doc.RootElement.ValueKind == JsonValueKind.Object &&
+               doc.RootElement.TryGetProperty("injected_script", out var script)
+            ? script.GetString() ?? ""
+            : "";
+    }
 
     /// <summary>Generic hide selectors matching the given class names and ids (JSON arrays).</summary>
     public string HiddenSelectors(JsonElement classes, JsonElement ids, JsonElement exceptions) =>

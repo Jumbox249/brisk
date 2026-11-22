@@ -17,6 +17,8 @@ sealed class BrowserTab
     /// <summary>Top-level page URL, used as the source when matching subresource requests.</summary>
     public string PageUrl = "";
     public bool AdblockOn = true;
+    /// <summary>Scriptlet scripts registered in this tab's view, by host (null: the host has none).</summary>
+    public readonly Dictionary<string, string?> Scriptlets = new(StringComparer.OrdinalIgnoreCase);
     public int Blocked;
     public bool Loading;
     public float Progress;
@@ -59,7 +61,8 @@ sealed class BrowserForm : Form
 
     bool _fullscreen;
     FormWindowState _preFullscreenState;
-    bool _dnsChangePending;
+    DnsHealth? _dnsHealth;
+    (bool On, string Server) _appliedDns;
 
     public BrowserForm()
     {
@@ -116,6 +119,7 @@ sealed class BrowserForm : Form
         base.OnLoad(e);
         InstallWheelHook();
         RestoreSession();
+        _ = RefreshScriptletsAsync();
     }
 
     protected override void OnHandleCreated(EventArgs e)
@@ -250,7 +254,14 @@ sealed class BrowserForm : Form
             "--force-webrtc-ip-handling-policy=default_public_interface_only",
         };
         var userDataDir = Path.Combine(Settings.DataDir, "Profile");
+        _appliedDns = (_settings.DnsBlocking, _settings.DnsServer);
         await Task.Run(() => ConfigureSecureDns(userDataDir));
+        if (_settings.DnsBlocking)
+        {
+            _dnsHealth = new DnsHealth(_settings.DnsServer);
+            _dnsHealth.Changed += UpdateShield;
+            _dnsHealth.Start();
+        }
         var port = Environment.GetEnvironmentVariable("BRISK_REMOTE_DEBUGGING_PORT");
         if (int.TryParse(port, out var p)) args.Add($"--remote-debugging-port={p}");
 
@@ -264,7 +275,8 @@ sealed class BrowserForm : Form
 
     /// <summary>
     /// The backup ad-blocking layer: resolve every hostname through an ad-blocking DNS-over-HTTPS
-    /// server in secure mode (no fallback to the system resolver). WebView2 ignores the DoH feature
+    /// server. "automatic" mode falls back to the system resolver if that server is unreachable, so
+    /// an outage never stops pages loading (DnsHealth warns the user instead). WebView2 ignores the DoH feature
     /// flags, but honours the same "Local State" preferences Chromium uses, so set them before the
     /// browser process starts.
     /// </summary>
@@ -277,13 +289,23 @@ sealed class BrowserForm : Form
                 ? JsonNode.Parse(File.ReadAllText(path)) as JsonObject ?? new JsonObject()
                 : new JsonObject();
             if (_settings.DnsBlocking)
-                state["dns_over_https"] = new JsonObject { ["mode"] = "secure", ["templates"] = _settings.DnsServer };
+                state["dns_over_https"] = new JsonObject { ["mode"] = "automatic", ["templates"] = _settings.DnsServer };
             else if (!state.Remove("dns_over_https"))
                 return;
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
             File.WriteAllText(path, state.ToJsonString());
         }
         catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException) { }
+    }
+
+    /// <summary>Rebuilds uBO's scriptlet resources in the background when they are missing or old.</summary>
+    async Task RefreshScriptletsAsync()
+    {
+        if (!AdBlocker.ResourcesStale) return;
+        var env = await _env;
+        await Task.Delay(TimeSpan.FromSeconds(3)); // let the first page get going first
+        var json = await ScriptletConverter.ConvertAsync(env, Handle);
+        if (json is not null) _adblock.SetResources(json);
     }
 
     // ---------- Tabs ----------
@@ -374,6 +396,13 @@ sealed class BrowserForm : Form
         core.WebResourceRequested += (_, e) => OnResourceRequested(tab, env, e);
         core.WebMessageReceived += (_, e) => OnWebMessage(tab, core, e);
         core.NavigationStarting += (_, e) => OnNavigationStarting(tab, core, e);
+        core.FrameNavigationStarting += (_, e) =>
+        {
+            // Embedded frames (a YouTube player on another site, say) get their host's scriptlets
+            // too. Frames can't be held back, so this is best effort for the first frame load.
+            if (Uri.TryCreate(e.Uri, UriKind.Absolute, out var frameUri) && NeedsScriptlets(tab, frameUri, out var script))
+                _ = RegisterScriptletsAsync(tab, core, frameUri.Host, script);
+        };
         core.ContentLoading += (_, _) => { tab.Progress = Math.Max(tab.Progress, 0.45f); };
         core.NavigationCompleted += (_, _) =>
         {
@@ -387,7 +416,7 @@ sealed class BrowserForm : Form
         {
             tab.Title = string.IsNullOrWhiteSpace(core.DocumentTitle) ? TitleFor(core.Source) : core.DocumentTitle;
             _tabBar.Invalidate();
-            if (tab == _active) Text = tab.Title + " — Brisk";
+            if (tab == _active) Text = tab.Title + " â€” Brisk";
         };
         core.FaviconChanged += async (_, _) =>
         {
@@ -442,6 +471,17 @@ sealed class BrowserForm : Form
         }
         tab.PageUrl = e.Uri;
         tab.AdblockOn = _settings.IsAdblockEnabledFor(uri);
+
+        // Scriptlets have to be in place before the page's own scripts run. The first time this tab
+        // visits a host that has them, hold the navigation until they are registered.
+        if (uri is not null && NeedsScriptlets(tab, uri, out var script))
+        {
+            e.Cancel = true;
+            _ = RegisterScriptletsAsync(tab, core, uri.Host, script).ContinueWith(
+                _ => core.Navigate(uri.AbsoluteUri), TaskScheduler.FromCurrentSynchronizationContext());
+            return;
+        }
+
         tab.Blocked = 0;
         tab.Loading = true;
         tab.Progress = 0.08f;
@@ -449,6 +489,38 @@ sealed class BrowserForm : Form
         {
             UpdateChrome();
             _progressTimer.Start();
+        }
+    }
+
+    bool NeedsScriptlets(BrowserTab tab, Uri uri, out string script)
+    {
+        script = "";
+        if (!tab.AdblockOn || !_adblock.IsReady || uri.Scheme is not ("http" or "https") || tab.Scriptlets.ContainsKey(uri.Host))
+            return false;
+        script = _adblock.InjectedScript(uri.AbsoluteUri);
+        if (script.Length == 0) tab.Scriptlets[uri.Host] = null;
+        return script.Length > 0;
+    }
+
+    static async Task RegisterScriptletsAsync(BrowserTab tab, CoreWebView2 core, string host, string script)
+    {
+        tab.Scriptlets[host] = null; // reserve, so a second navigation doesn't register twice
+        // Document-created scripts run in every frame of every later document, so scope this one to its host.
+        var wrapped = $"if (location.hostname === {JsonSerializer.Serialize(host)}) {{\n{script}\n}}";
+        try { tab.Scriptlets[host] = await core.AddScriptToExecuteOnDocumentCreatedAsync(wrapped); }
+        catch (COMException) { tab.Scriptlets.Remove(host); }
+    }
+
+    /// <summary>Unregisters scriptlets for a site in every tab, e.g. after ad blocking was turned off there.</summary>
+    void ForgetScriptlets(string siteKey)
+    {
+        foreach (var tab in _tabs)
+        {
+            foreach (var host in tab.Scriptlets.Keys.Where(h => Settings.SiteKey(new Uri("https://" + h)) == siteKey).ToList())
+            {
+                if (tab.Scriptlets[host] is { } id) tab.View?.CoreWebView2?.RemoveScriptToExecuteOnDocumentCreated(id);
+                tab.Scriptlets.Remove(host);
+            }
         }
     }
 
@@ -503,7 +575,10 @@ sealed class BrowserForm : Form
             switch (type.GetString())
             {
                 case "brisk-init" when m.TryGetProperty("url", out var url):
-                    core.PostWebMessageAsJson("{\"type\":\"brisk-init\",\"r\":" + _adblock.UrlCosmetics(url.GetString() ?? "") + "}");
+                    // The page only needs the hiding rules; scriptlets are injected separately.
+                    var cosmetics = JsonNode.Parse(_adblock.UrlCosmetics(url.GetString() ?? "")) as JsonObject ?? new JsonObject();
+                    cosmetics.Remove("injected_script");
+                    core.PostWebMessageAsJson("{\"type\":\"brisk-init\",\"r\":" + cosmetics.ToJsonString() + "}");
                     break;
                 case "brisk-classes" when m.TryGetProperty("classes", out var classes) &&
                                           m.TryGetProperty("ids", out var ids) &&
@@ -523,6 +598,7 @@ sealed class BrowserForm : Form
         if (key.Length == 0) return;
         if (!_settings.AdblockDisabledSites.Remove(key)) _settings.AdblockDisabledSites.Add(key);
         _settings.Save();
+        ForgetScriptlets(key);
         _active.AdblockOn = _settings.IsAdblockEnabledFor(uri);
         UpdateShield();
         _active.View?.Reload();
@@ -551,7 +627,7 @@ sealed class BrowserForm : Form
         _address.Loading = _active.Loading;
         _back.Enabled = _active.View?.CanGoBack == true;
         _forward.Enabled = _active.View?.CanGoForward == true;
-        Text = _active.Title + " — Brisk";
+        Text = _active.Title + " â€” Brisk";
         UpdateShield();
         if (_active.Loading || _address.Progress > 0) _progressTimer.Start();
     }
@@ -559,7 +635,10 @@ sealed class BrowserForm : Form
     void UpdateShield()
     {
         if (_active is null) return;
-        _shield.SetState(_active.AdblockOn, _active.Blocked);
+        _shield.SetState(_active.AdblockOn, _active.Blocked, _dnsHealth?.Unreachable == true);
+        _tips.SetToolTip(_shield, _dnsHealth?.Unreachable == true
+            ? $"{_settings.DnsName} can't be reached, so Brisk is using your normal DNS for now. The main ad blocker still works."
+            : "Ad blocking for this site. Click to turn it off or on.");
     }
 
     /// <summary>Eases the field's progress bar toward the tab's real progress, then fades it out.</summary>
@@ -636,16 +715,26 @@ sealed class BrowserForm : Form
             _menuStrip.Items.Add(item);
         }
 
-        var dns = new ToolStripMenuItem("Ad-Blocking DNS") { Checked = _settings.DnsBlocking };
-        dns.Click += (_, _) =>
+        var dns = new ToolStripMenuItem("Ad-Blocking DNS");
+        void AddDns(string name, bool on, string server)
         {
-            _settings.DnsBlocking = !_settings.DnsBlocking;
-            _settings.Save();
-            _dnsChangePending = !_dnsChangePending;
-        };
+            bool current = _settings.DnsBlocking == on && (!on || _settings.DnsServer == server);
+            var item = new ToolStripMenuItem(name) { Checked = current };
+            item.Click += (_, _) =>
+            {
+                _settings.DnsBlocking = on;
+                if (on) _settings.DnsServer = server;
+                _settings.Save();
+            };
+            dns.DropDownItems.Add(item);
+        }
+        AddDns("Off", false, "");
+        foreach (var provider in Settings.DnsProviders) AddDns(provider.Name, true, provider.Url);
         _menuStrip.Items.Add(dns);
-        if (_dnsChangePending)
+        if ((_settings.DnsBlocking, _settings.DnsServer) != _appliedDns && (_settings.DnsBlocking || _appliedDns.On))
             _menuStrip.Items.Add(new ToolStripMenuItem("Restart Brisk to Apply the DNS Change") { Enabled = false });
+        else if (_dnsHealth?.Unreachable == true)
+            _menuStrip.Items.Add(new ToolStripMenuItem($"{_settings.DnsName} Is Unreachable, Using Normal DNS") { Enabled = false });
         _menuStrip.Items.Add("Update Filter Lists", null, (_, _) => _adblock.UpdateLists());
         _menuStrip.Items.Add(new ToolStripSeparator());
 
@@ -667,6 +756,7 @@ sealed class BrowserForm : Form
                 {
                     _settings.AdblockDisabledSites.Remove(s);
                     _settings.Save();
+                    ForgetScriptlets(s);
                     foreach (var t in _tabs.Where(t => TitleFor(t.Url) == s)) { t.AdblockOn = true; t.View?.Reload(); }
                     UpdateShield();
                 });
@@ -855,6 +945,7 @@ sealed class BrowserForm : Form
             Theme.Changed -= ApplyTheme;
             if (_wheelHook != IntPtr.Zero) UnhookWindowsHookEx(_wheelHook);
             _progressTimer.Dispose();
+            _dnsHealth?.Dispose();
             _adblock.Dispose();
         }
         base.Dispose(disposing);

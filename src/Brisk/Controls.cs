@@ -273,15 +273,17 @@ sealed class GlyphButton : ChromeControl
 /// <summary>Ad-blocking toggle: filled shield with the number of blocked requests, or a slashed outline when off.</summary>
 sealed class ShieldButton : ChromeControl
 {
-    bool _on = true;
+    bool _on = true, _warning;
     int _count;
     readonly Font _font = Theme.Ui(8.5f, FontStyle.Bold);
 
-    public void SetState(bool on, int count)
+    /// <param name="warning">Shows an orange dot: the ad-blocking DNS server is unreachable.</param>
+    public void SetState(bool on, int count, bool warning = false)
     {
-        if (on == _on && count == _count) return;
+        if (on == _on && count == _count && warning == _warning) return;
         _on = on;
         _count = count;
+        _warning = warning;
         Invalidate();
     }
 
@@ -304,6 +306,14 @@ sealed class ShieldButton : ChromeControl
         float x = (Width - total) / 2;
         var color = _on ? T.Glyph : T.Secondary;
         Glyphs.Shield(g, new RectangleF(x, (Height - s) / 2, s, s), color, Dp(1.5f), _on);
+        if (_warning)
+        {
+            float d = Dp(7);
+            using var ring = new SolidBrush(Parent?.BackColor ?? T.Toolbar);
+            using var dot = new SolidBrush(Color.FromArgb(255, 149, 0));
+            g.FillEllipse(ring, x + s - d * 0.6f - Dp(1.5f), (Height - s) / 2 - Dp(1.5f), d + Dp(3), d + Dp(3));
+            g.FillEllipse(dot, x + s - d * 0.6f, (Height - s) / 2, d, d);
+        }
         TextRenderer.DrawText(g, label, _font, new Point((int)(x + s + gap), (Height - textSize.Height) / 2), color, TextFormatFlags.NoPadding);
     }
 }

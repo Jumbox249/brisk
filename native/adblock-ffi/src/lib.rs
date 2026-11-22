@@ -8,6 +8,7 @@ use std::slice;
 
 use adblock::lists::{FilterSet, ParseOptions};
 use adblock::request::Request;
+use adblock::resources::Resource;
 use adblock::Engine;
 
 unsafe fn to_str<'a>(p: *const c_char) -> &'a str {
@@ -79,7 +80,22 @@ pub unsafe extern "C" fn brisk_engine_check(
     (*engine).check_network_request(&request).should_block() as i32
 }
 
-/// Returns JSON `{"hide_selectors":[...],"exceptions":[...],"generichide":bool}` for a page URL.
+/// Loads scriptlet resources (a JSON array of adblock-rust `Resource`s), replacing any loaded
+/// before. Returns how many were loaded, or -1 if the JSON is invalid.
+#[no_mangle]
+pub unsafe extern "C" fn brisk_engine_use_resources(engine: *mut Engine, json: *const c_char) -> i32 {
+    match serde_json::from_str::<Vec<Resource>>(to_str(json)) {
+        Ok(resources) => {
+            let n = resources.len() as i32;
+            (*engine).use_resources(resources);
+            n
+        }
+        Err(_) => -1,
+    }
+}
+
+/// Returns JSON `{"hide_selectors":[...],"exceptions":[...],"generichide":bool,"injected_script":"..."}`
+/// for a page URL.
 /// Free with `brisk_free_string`.
 #[no_mangle]
 pub unsafe extern "C" fn brisk_engine_url_cosmetics(engine: *const Engine, url: *const c_char) -> *mut c_char {
@@ -88,6 +104,7 @@ pub unsafe extern "C" fn brisk_engine_url_cosmetics(engine: *const Engine, url: 
         "hide_selectors": res.hide_selectors,
         "exceptions": res.exceptions,
         "generichide": res.generichide,
+        "injected_script": res.injected_script,
     });
     to_c_string(json.to_string())
 }

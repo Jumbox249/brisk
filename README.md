@@ -10,8 +10,16 @@ The whole app is about **5 MB**. It uses the Edge WebView2 engine that already s
 
 There are two layers.
 
-1. **Brave's [adblock-rust](https://github.com/brave/adblock-rust) engine** is the main blocker. It uses EasyList, EasyPrivacy and Peter Lowe's list, and checks every request a page makes before it leaves your machine. It also hides the empty boxes left where ads were blocked. The lists refresh in the background every few days, and the compiled engine is cached so startup stays fast.
-2. **Ad-blocking DNS** is the backup layer. Every hostname is looked up over encrypted DNS-over-HTTPS through [AdGuard DNS](https://adguard-dns.io/), in secure mode with no fallback to your ISP's DNS. Ad and tracker domains don't resolve at all.
+1. **Brave's [adblock-rust](https://github.com/brave/adblock-rust) engine** is the main blocker. It uses EasyList, EasyPrivacy, Peter Lowe's list and uBlock Origin's own lists, and checks every request a page makes before it leaves your machine. It also hides the empty boxes left where ads were blocked. The lists refresh in the background every few days, and the compiled engine is cached so startup stays fast.
+2. **Ad-blocking DNS** is the backup layer. Every hostname is looked up over encrypted DNS-over-HTTPS through an ad-blocking DNS service: [AdGuard DNS](https://adguard-dns.io/) by default, or Mullvad DNS or Control D (**⋯ → Ad-Blocking DNS**). Ad and tracker domains don't resolve at all. If the service can't be reached, Brisk falls back to your normal DNS so pages keep loading, and shows an orange dot on the shield until it's back.
+
+### YouTube ads and page scripts
+
+Some ads, like YouTube's video ads, come from the same servers as the content, so they can't be blocked by address. uBlock Origin's lists handle these with small scripts that run in the page and strip the ads out, for example removing the ad entries from YouTube's player data. Brisk runs the same scripts, the way Brave does:
+
+- They aren't bundled with Brisk. Once a week Brisk downloads uBlock Origin's script library from its latest release and converts it inside a hidden, sandboxed browser view with no network access.
+- When you open a site that has script rules, Brisk injects them before the site's own code runs.
+- Turning ad blocking off for a site turns its scripts off too.
 
 ### Turning it off for a site
 

@@ -23,6 +23,16 @@ sealed class Settings
 
     public string DnsServer { get; set; } = "https://dns.adguard-dns.com/dns-query";
 
+    public static readonly DnsProvider[] DnsProviders =
+    [
+        new("AdGuard DNS", "https://dns.adguard-dns.com/dns-query"),
+        new("Mullvad DNS", "https://adblock.dns.mullvad.net/dns-query"),
+        new("Control D", "https://freedns.controld.com/p2"),
+    ];
+
+    [JsonIgnore]
+    public string DnsName => DnsProviders.FirstOrDefault(p => p.Url == DnsServer)?.Name ?? "Ad-blocking DNS";
+
     /// <summary>Search URL; the query is appended URL-encoded.</summary>
     public string SearchUrl { get; set; } = "https://duckduckgo.com/?q=";
 
@@ -95,3 +105,5 @@ sealed class Settings
 }
 
 sealed record SearchEngine(string Name, string SearchUrl, string HomePage);
+
+sealed record DnsProvider(string Name, string Url);
