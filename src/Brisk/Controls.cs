@@ -138,6 +138,38 @@ static class Glyphs
         g.DrawLine(p, r.X + r.Width * 0.68f, r.Y + r.Height * 0.41f, r.X + r.Width * 0.68f, r.Y + r.Height * 0.47f);
     }
 
+    public static void Star(Graphics g, RectangleF r, Color c, float w, bool filled)
+    {
+        var pts = new PointF[10];
+        for (int i = 0; i < 10; i++)
+        {
+            double a = -Math.PI / 2 + i * Math.PI / 5;
+            float rad = i % 2 == 0 ? 0.5f : 0.21f;
+            pts[i] = new PointF(r.X + r.Width * (0.5f + rad * (float)Math.Cos(a)), r.Y + r.Height * (0.53f + rad * (float)Math.Sin(a)));
+        }
+        using var p = P(c, w);
+        if (filled)
+        {
+            using var b = new SolidBrush(c);
+            g.FillPolygon(b, pts);
+        }
+        g.DrawPolygon(p, pts);
+    }
+
+    public static void Search(Graphics g, RectangleF r, Color c, float w)
+    {
+        using var p = P(c, w);
+        g.DrawEllipse(p, r.X + r.Width * 0.12f, r.Y + r.Height * 0.12f, r.Width * 0.56f, r.Height * 0.56f);
+        g.DrawLine(p, At(r, 0.62f, 0.62f), At(r, 0.88f, 0.88f));
+    }
+
+    public static void Clock(Graphics g, RectangleF r, Color c, float w)
+    {
+        using var p = P(c, w);
+        g.DrawEllipse(p, RectangleF.Inflate(r, -r.Width * 0.08f, -r.Height * 0.08f));
+        g.DrawLines(p, [At(r, 0.5f, 0.26f), At(r, 0.5f, 0.52f), At(r, 0.68f, 0.62f)]);
+    }
+
     public static GraphicsPath ShieldPath(RectangleF r)
     {
         var s = new GraphicsPath();
@@ -243,6 +275,8 @@ sealed class GlyphButton : ChromeControl
 {
     readonly Glyphs.Painter _paint;
     public float GlyphSize = 16;
+    /// <summary>Overrides the theme's glyph colour (e.g. light icons on the private window's dark field).</summary>
+    public Color? GlyphColor;
 
     public GlyphButton(Glyphs.Painter paint, string tip, ToolTip tips)
     {
@@ -265,7 +299,8 @@ sealed class GlyphButton : ChromeControl
         }
         float s = Dp(GlyphSize);
         var r = new RectangleF((Width - s) / 2, (Height - s) / 2, s, s);
-        var color = Enabled ? T.Glyph : Color.FromArgb(T.Dark ? 90 : 70, T.Glyph);
+        var glyph = GlyphColor ?? T.Glyph;
+        var color = Enabled ? glyph : Color.FromArgb(T.Dark ? 90 : 70, glyph);
         _paint(g, r, color, Dp(1.7f));
     }
 }
@@ -378,13 +413,20 @@ sealed class AddressField : ChromeControl
     readonly TextBox _box = new() { BorderStyle = BorderStyle.None };
     string _placeholder = "Search or enter website name";
     readonly Font _font = Theme.Ui(10f);
-    readonly GlyphButton _reload;
+    readonly Font _badgeFont = Theme.Ui(7.5f, FontStyle.Bold);
+    readonly GlyphButton _reload, _star;
     string _url = "";
-    bool _loading;
+    bool _loading, _bookmarked, _private;
     float _progress;
 
     public event Action<string>? Submitted;
     public event Action? ReloadClicked;
+    public event Action? BookmarkClicked;
+    /// <summary>The typed text changed while editing (drives the suggestions list).</summary>
+    public event Action<string>? EditTextChanged;
+    /// <summary>A key pressed while editing; return true to swallow it (arrow keys in the suggestions).</summary>
+    public event Func<Keys, bool>? EditKeyDown;
+    public event Action? EditEnded;
 
     public AddressField(ToolTip tips)
     {
@@ -392,35 +434,64 @@ sealed class AddressField : ChromeControl
         _box.Visible = false;
         _box.KeyDown += (_, e) =>
         {
+            if (EditKeyDown?.Invoke(e.KeyCode) == true) { e.SuppressKeyPress = true; return; }
             if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; var text = _box.Text; EndEdit(); Submitted?.Invoke(text); }
             else if (e.KeyCode == Keys.Escape) { e.SuppressKeyPress = true; EndEdit(); }
         };
+        _box.TextChanged += (_, _) => { if (Editing) EditTextChanged?.Invoke(_box.Text); };
         _box.LostFocus += (_, _) => EndEdit();
         Controls.Add(_box);
 
         _reload = new GlyphButton((g, r, c, w) => { if (_loading) Glyphs.Stop(g, r, c, w); else Glyphs.Reload(g, r, c, w); }, "Reload (F5)", tips)
         { GlyphSize = 13 };
         _reload.Click += (_, _) => ReloadClicked?.Invoke();
+        _star = new GlyphButton((g, r, c, w) => Glyphs.Star(g, r, _bookmarked ? T.Accent : c, w, _bookmarked), "Bookmark this page (Ctrl+D)", tips)
+        { GlyphSize = 14 };
+        _star.Click += (_, _) => BookmarkClicked?.Invoke();
         Controls.Add(_reload);
+        Controls.Add(_star);
         Cursor = Cursors.IBeam;
         Theme.Changed += ApplyTheme;
         ApplyTheme();
     }
 
+    // Private windows get a dark field, as in Safari.
+    Color FieldColor => _private ? (T.Dark ? Color.FromArgb(20, 20, 22) : Color.FromArgb(58, 58, 60)) : T.Field;
+    Color EditColor => _private ? FieldColor : T.FieldEditing;
+    Color TextColor => _private ? Color.White : T.Text;
+    Color HintColor => _private ? Color.FromArgb(174, 174, 178) : T.Secondary;
+
     void ApplyTheme()
     {
-        _box.BackColor = T.FieldEditing;
-        _box.ForeColor = T.Text;
-        BackColor = T.Field;
+        _box.BackColor = EditColor;
+        _box.ForeColor = TextColor;
+        BackColor = FieldColor;
+        _star.GlyphColor = _reload.GlyphColor = _private ? HintColor : null;
+        _star.Invalidate();
+        _reload.Invalidate();
         Invalidate();
     }
 
+    public bool Private
+    {
+        get => _private;
+        set { _private = value; ApplyTheme(); LayoutParts(); }
+    }
+
     public bool Editing => _box.Visible;
+
+    public string EditText => _box.Text;
 
     public bool Loading
     {
         get => _loading;
         set { if (_loading != value) { _loading = value; _reload.Invalidate(); } }
+    }
+
+    public bool Bookmarked
+    {
+        get => _bookmarked;
+        set { if (_bookmarked != value) { _bookmarked = value; _star.Invalidate(); } }
     }
 
     /// <summary>0..1 while loading; any negative value hides the bar.</summary>
@@ -437,29 +508,35 @@ sealed class AddressField : ChromeControl
         set { _placeholder = value; _box.PlaceholderText = value; Invalidate(); }
     }
 
+    /// <summary>Pages that show the placeholder instead of their address (blank and start pages).</summary>
+    static bool IsBlank(string url) => url.Length == 0 || url.StartsWith("about:", StringComparison.Ordinal) || StartPage.Is(url);
+
     public void SetUrl(string url)
     {
         _url = url;
+        _star.Visible = !Editing && !IsBlank(url) && url.StartsWith("http", StringComparison.OrdinalIgnoreCase);
         if (!Editing) Invalidate();
     }
 
     public void BeginEdit()
     {
-        _box.Text = _url.StartsWith("about:", StringComparison.Ordinal) ? "" : _url;
+        _box.Text = IsBlank(_url) ? "" : _url;
         _box.Visible = true;
-        _reload.Visible = false;
+        _reload.Visible = _star.Visible = false;
         LayoutParts();
         _box.Focus();
         _box.SelectAll();
         Invalidate();
     }
 
-    void EndEdit()
+    public void EndEdit()
     {
         if (!Editing) return;
         _box.Visible = false;
         _reload.Visible = true;
+        SetUrl(_url);
         Invalidate();
+        EditEnded?.Invoke();
     }
 
     protected override void OnMouseDown(MouseEventArgs e)
@@ -476,11 +553,13 @@ sealed class AddressField : ChromeControl
 
     void LayoutParts()
     {
-        if (_reload is null) return; // layout runs while the constructor is still adding children
+        if (_reload is null || _star is null) return; // layout runs while the constructor is still adding children
         int pad = (int)Dp(12), btn = Height - (int)Dp(6);
         _reload.SetBounds(Width - btn - (int)Dp(3), (Height - btn) / 2, btn, btn);
+        _star.SetBounds(_reload.Left - btn, (Height - btn) / 2, btn, btn);
+        int badge = _private ? (int)Dp(62) : 0;
         int h = _box.PreferredHeight;
-        _box.SetBounds(pad, (Height - h) / 2 + 1, Math.Max(0, Width - pad * 2), h);
+        _box.SetBounds(pad + badge, (Height - h) / 2 + 1, Math.Max(0, Width - pad * 2 - badge), h);
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -494,7 +573,7 @@ sealed class AddressField : ChromeControl
 
         if (Editing)
         {
-            using var fill = new SolidBrush(T.FieldEditing);
+            using var fill = new SolidBrush(EditColor);
             g.FillPath(fill, path);
             using var ring = new Pen(Color.FromArgb(150, T.Accent), Dp(2.5f));
             using var inner = Shapes.Rounded(RectangleF.Inflate(rect, -Dp(1.25f), -Dp(1.25f)), radius - Dp(1.25f));
@@ -502,9 +581,16 @@ sealed class AddressField : ChromeControl
         }
         else
         {
-            using var fill = new SolidBrush(Hovered ? ControlPaint.Dark(T.Field, T.Dark ? -0.15f : 0.02f) : T.Field);
+            using var fill = new SolidBrush(Hovered ? ControlPaint.Dark(FieldColor, T.Dark || _private ? -0.15f : 0.02f) : FieldColor);
             g.FillPath(fill, path);
             DrawRestingText(g);
+        }
+
+        if (_private)
+        {
+            var badge = new Rectangle((int)Dp(12), 0, (int)Dp(56), Height);
+            TextRenderer.DrawText(g, "PRIVATE", _badgeFont, badge, HintColor,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
         }
 
         if (_progress > 0)
@@ -521,18 +607,22 @@ sealed class AddressField : ChromeControl
     {
         string text;
         bool secure = false;
-        if (Uri.TryCreate(_url, UriKind.Absolute, out var u) && u.Host.Length > 0)
+        if (IsBlank(_url))
+        {
+            text = _placeholder;
+        }
+        else if (Uri.TryCreate(_url, UriKind.Absolute, out var u) && u.Host.Length > 0)
         {
             text = Settings.SiteKey(u);
             secure = u.Scheme == "https";
         }
         else
         {
-            text = _url.Length == 0 || _url.StartsWith("about:", StringComparison.Ordinal) ? _placeholder : _url;
+            text = _url;
         }
 
         bool placeholder = text == _placeholder;
-        int maxText = Width - (int)Dp(80);
+        int maxText = Width - (int)Dp(_private ? 150 : 100);
         var size = TextRenderer.MeasureText(g, text, _font, new Size(maxText, Height), TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
         size.Width = Math.Min(size.Width, maxText);
         float lockW = secure ? Dp(11) + Dp(6) : 0;
@@ -540,10 +630,10 @@ sealed class AddressField : ChromeControl
         if (secure)
         {
             float s = Dp(11);
-            Glyphs.Lock(g, new RectangleF(x, (Height - s) / 2 - Dp(0.5f), s, s), T.Secondary, Dp(1.4f));
+            Glyphs.Lock(g, new RectangleF(x, (Height - s) / 2 - Dp(0.5f), s, s), HintColor, Dp(1.4f));
         }
         TextRenderer.DrawText(g, text, _font, new Rectangle((int)(x + lockW), (Height - size.Height) / 2, size.Width, size.Height),
-            placeholder ? T.Secondary : T.Text, TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            placeholder ? HintColor : TextColor, TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
     }
 
     protected override void Dispose(bool disposing)
@@ -553,7 +643,10 @@ sealed class AddressField : ChromeControl
     }
 }
 
-/// <summary>Safari-style tab bar: equal-width tabs that fill the row, favicon + centred title, close button on hover.</summary>
+/// <summary>
+/// Safari-style tab bar: equal-width tabs that fill the row, favicon + centred title, close button on
+/// hover. Pinned tabs sit at the left as compact icons. Tabs can be dragged to reorder them.
+/// </summary>
 sealed class TabBar : ChromeControl
 {
     readonly Font _font = Theme.Ui(9f);
@@ -561,19 +654,31 @@ sealed class TabBar : ChromeControl
     int _hover = -1;
     bool _hoverClose;
     string _tip = "";
+    int _pressIndex = -1;
+    Point _pressPoint;
+    bool _dragging;
 
     public IReadOnlyList<BrowserTab> Tabs = [];
     public BrowserTab? Active;
 
     public event Action<BrowserTab>? TabSelected;
     public event Action<BrowserTab>? TabClosed;
+    /// <summary>A tab was dragged to a new index.</summary>
+    public event Action<BrowserTab, int>? TabMoved;
+    public event Action<BrowserTab, Point>? TabContextMenu;
 
     public TabBar(ToolTip tips) => _tips = tips;
 
+    int PinnedCount => Tabs.TakeWhile(t => t.Pinned).Count();
+
     RectangleF TabRect(int i)
     {
-        float w = (float)Width / Math.Max(1, Tabs.Count);
-        return new RectangleF(i * w, 0, w, Height);
+        int pinned = PinnedCount;
+        float pinW = Dp(44);
+        if (i < pinned) return new RectangleF(i * pinW, 0, pinW, Height);
+        float start = pinned * pinW;
+        float w = (Width - start) / Math.Max(1, Tabs.Count - pinned);
+        return new RectangleF(start + (i - pinned) * w, 0, w, Height);
     }
 
     RectangleF CloseRect(RectangleF tab)
@@ -581,6 +686,8 @@ sealed class TabBar : ChromeControl
         float s = Dp(18);
         return new RectangleF(tab.X + Dp(7), (Height - s) / 2, s, s);
     }
+
+    bool HasClose(int i) => i >= 0 && i < Tabs.Count && !Tabs[i].Pinned;
 
     int HitTab(Point p)
     {
@@ -590,8 +697,13 @@ sealed class TabBar : ChromeControl
 
     protected override void OnMouseMove(MouseEventArgs e)
     {
+        if (_pressIndex >= 0 && e.Button == MouseButtons.Left)
+        {
+            if (!_dragging && Math.Abs(e.X - _pressPoint.X) > Dp(6)) _dragging = true;
+            if (_dragging) DragTo(e.X);
+        }
         var i = HitTab(e.Location);
-        var overClose = i >= 0 && CloseRect(TabRect(i)).Contains(e.Location);
+        var overClose = HasClose(i) && CloseRect(TabRect(i)).Contains(e.Location);
         if (i != _hover || overClose != _hoverClose)
         {
             _hover = i;
@@ -601,6 +713,26 @@ sealed class TabBar : ChromeControl
             if (tip != _tip) { _tip = tip; _tips.SetToolTip(this, tip); }
         }
         base.OnMouseMove(e);
+    }
+
+    /// <summary>Moves the dragged tab to the slot under the pointer, within its own (pinned or not) group.</summary>
+    void DragTo(int x)
+    {
+        var tab = Tabs[_pressIndex];
+        int pinned = PinnedCount;
+        int first = tab.Pinned ? 0 : pinned, last = tab.Pinned ? pinned - 1 : Tabs.Count - 1;
+        int target = _pressIndex;
+        for (int i = first; i <= last; i++)
+        {
+            var r = TabRect(i);
+            if (x >= r.Left && x < r.Right) { target = i; break; }
+            if (i == first && x < r.Left) target = first;
+            if (i == last && x >= r.Right) target = last;
+        }
+        if (target == _pressIndex) return;
+        TabMoved?.Invoke(tab, target);
+        _pressIndex = target;
+        Invalidate();
     }
 
     protected override void OnMouseLeave(EventArgs e)
@@ -614,15 +746,28 @@ sealed class TabBar : ChromeControl
     {
         base.OnMouseDown(e);
         var i = HitTab(e.Location);
-        if (i >= 0 && e.Button == MouseButtons.Left && !CloseRect(TabRect(i)).Contains(e.Location)) TabSelected?.Invoke(Tabs[i]);
+        if (i < 0) return;
+        if (e.Button == MouseButtons.Left && !(HasClose(i) && CloseRect(TabRect(i)).Contains(e.Location)))
+        {
+            _pressIndex = i;
+            _pressPoint = e.Location;
+            _dragging = false;
+            TabSelected?.Invoke(Tabs[i]);
+        }
     }
 
     protected override void OnMouseUp(MouseEventArgs e)
     {
         base.OnMouseUp(e);
+        bool wasDragging = _dragging;
+        _pressIndex = -1;
+        _dragging = false;
+        if (wasDragging) return;
         var i = HitTab(e.Location);
         if (i < 0) return;
-        if (e.Button == MouseButtons.Middle || (e.Button == MouseButtons.Left && CloseRect(TabRect(i)).Contains(e.Location)))
+        if (e.Button == MouseButtons.Right) { TabContextMenu?.Invoke(Tabs[i], e.Location); return; }
+        if (!Tabs[i].Pinned &&
+            (e.Button == MouseButtons.Middle || (e.Button == MouseButtons.Left && CloseRect(TabRect(i)).Contains(e.Location))))
             TabClosed?.Invoke(Tabs[i]);
     }
 
@@ -650,29 +795,26 @@ sealed class TabBar : ChromeControl
                 g.DrawLine(sepPen, r.X, Dp(8), r.X, Height - Dp(8));
 
             float icon = Dp(16), gap = Dp(6);
+            if (tab.Pinned)
+            {
+                DrawIcon(g, tab, new RectangleF(r.X + (r.Width - icon) / 2, (Height - icon) / 2, icon, icon));
+                continue;
+            }
+
             float maxText = r.Width - Dp(60) - icon - gap;
             var text = tab.Title;
             var ts = TextRenderer.MeasureText(g, text, _font, new Size((int)Math.Max(0, maxText), Height), TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine);
             float textW = Math.Min(ts.Width, Math.Max(0, maxText));
             float total = icon + gap + textW;
             float x = r.X + (r.Width - total) / 2;
-            float y = (Height - icon) / 2;
-            if (tab.Favicon is { } fav)
-            {
-                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                g.DrawImage(fav, x, y, icon, icon);
-            }
-            else
-            {
-                DrawGlobe(g, new RectangleF(x + Dp(1), y + Dp(1), icon - Dp(2), icon - Dp(2)));
-            }
+            DrawIcon(g, tab, new RectangleF(x, (Height - icon) / 2, icon, icon));
             if (textW > 4)
             {
                 TextRenderer.DrawText(g, text, _font, new Rectangle((int)(x + icon + gap), (Height - ts.Height) / 2, (int)textW, ts.Height),
                     active ? T.Text : T.Secondary, TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
             }
 
-            if (hover || (active && Tabs.Count > 1 && _hover == i))
+            if (hover && !_dragging)
             {
                 var cr = CloseRect(r);
                 if (_hoverClose)
@@ -689,12 +831,21 @@ sealed class TabBar : ChromeControl
         g.DrawLine(sepPen, 0, 0, Width, 0);
     }
 
-    void DrawGlobe(Graphics g, RectangleF r)
+    void DrawIcon(Graphics g, BrowserTab tab, RectangleF r)
     {
-        using var p = new Pen(T.Secondary, Dp(1.2f));
-        g.DrawEllipse(p, r);
-        g.DrawEllipse(p, r.X + r.Width * 0.3f, r.Y, r.Width * 0.4f, r.Height);
-        g.DrawLine(p, r.X, r.Y + r.Height / 2, r.Right, r.Y + r.Height / 2);
+        if (tab.Favicon is { } fav)
+        {
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+            g.DrawImage(fav, r.X, r.Y, r.Width, r.Height);
+        }
+        else
+        {
+            var inner = RectangleF.Inflate(r, -Dp(1), -Dp(1));
+            using var p = new Pen(T.Secondary, Dp(1.2f));
+            g.DrawEllipse(p, inner);
+            g.DrawEllipse(p, inner.X + inner.Width * 0.3f, inner.Y, inner.Width * 0.4f, inner.Height);
+            g.DrawLine(p, inner.X, inner.Y + inner.Height / 2, inner.Right, inner.Y + inner.Height / 2);
+        }
     }
 }
 

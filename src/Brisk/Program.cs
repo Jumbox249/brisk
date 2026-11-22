@@ -10,6 +10,9 @@ static class Program
     [DllImport("user32.dll")]
     static extern bool AllowSetForegroundWindow(int processId);
 
+    /// <summary>Opens a private window: <c>Brisk.exe --private [url]</c>.</summary>
+    const string PrivateSwitch = "--private";
+
     [STAThread]
     static void Main(string[] args)
     {
@@ -20,6 +23,7 @@ static class Program
         }
 
         var urls = args.Select(DefaultBrowser.ToUrl).OfType<string>().ToList();
+        bool privateWindow = args.Contains(PrivateSwitch);
 
         // One Brisk per profile: a second launch (say, a link clicked in another app) hands its
         // URLs to the running window over a named pipe and exits.
@@ -27,13 +31,13 @@ static class Program
         using var mutex = new Mutex(initiallyOwned: true, $@"Local\Brisk-{id}", out bool first);
         if (!first)
         {
-            if (SendToRunningInstance(id, urls)) return;
+            if (SendToRunningInstance(id, privateWindow ? [PrivateSwitch, .. urls] : urls)) return;
         }
 
         ApplicationConfiguration.Initialize();
-        var form = new BrowserForm(urls);
-        ListenForOtherInstances(id, form);
-        Application.Run(form);
+        var context = new BriskContext(urls, privateWindow);
+        ListenForOtherInstances(id, context);
+        Application.Run(context);
     }
 
     /// <summary>Distinguishes profiles, so separate data folders run separate windows.</summary>
@@ -58,11 +62,12 @@ static class Program
         }
     }
 
-    static void ListenForOtherInstances(string id, BrowserForm form)
+    static void ListenForOtherInstances(string id, BriskContext context)
     {
+        var ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
         var thread = new Thread(() =>
         {
-            while (!form.IsDisposed)
+            while (true)
             {
                 try
                 {
@@ -70,7 +75,11 @@ static class Program
                     pipe.WaitForConnection();
                     using var reader = new StreamReader(pipe, Encoding.UTF8);
                     var urls = reader.ReadToEnd().Split('\n', StringSplitOptions.RemoveEmptyEntries);
-                    if (form.IsHandleCreated) form.BeginInvoke(() => form.OpenFromOutside(urls));
+                    ui.Post(_ =>
+                    {
+                        if (urls.FirstOrDefault() == PrivateSwitch) context.OpenPrivateWindow(urls[1..]);
+                        else context.OpenFromOutside(urls);
+                    }, null);
                 }
                 catch (IOException) { }
             }

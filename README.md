@@ -40,13 +40,19 @@ The per-site switch controls the main blocker. The DNS layer applies to every si
 
 ## Other features
 
-- Tabs. Tabs restored from your last session don't load until you click them, so starting with many tabs is still instant.
+- **Start page.** New tabs open on a start page with your Favorites (bookmarks), Frequently Visited sites and a privacy report of how many ads and trackers Brisk has blocked. It's generated inside Brisk and never touches the network.
+- **History and bookmarks.** Click the star in the address bar (or press Ctrl+D) to bookmark a page. Both are in the **⋯** menu, and as you type in the address bar Brisk suggests matching bookmarks and history (use the arrow keys and Enter, or click).
+- **Private windows** (Ctrl+Shift+N). Nothing is saved to history, and cookies and site data are deleted when the window closes. Ad blocking works as usual.
+- **Tabs.** Drag tabs to reorder them. Right-click a tab to pin it, duplicate it or close other tabs; pinned tabs stay at the left as small icons and come back after a restart. Tabs restored from your last session don't load until you click them.
+- **Sleeping tabs.** Tabs you haven't looked at for 10 minutes are put to sleep so they stop using memory and processor time; tabs playing audio are left alone. Change the delay or turn it off under **⋯ → Sleeping Tabs**.
 - Links that open in a new window open in a new tab instead.
 - Full-screen video. Press F11 for full screen.
 
 | Shortcut | Action |
 |---|---|
 | Ctrl+T | New tab |
+| Ctrl+Shift+N | New private window |
+| Ctrl+D | Bookmark the page |
 | Ctrl+W, Ctrl+F4 | Close tab |
 | Ctrl+Shift+T | Reopen the last closed tab |
 | **Alt+scroll wheel** | Previous tab (scroll up) / next tab (scroll down) |

@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.Web.WebView2.Core;
@@ -14,6 +15,7 @@ sealed class BrowserTab
     public string Url = "";
     public string Title = "New Tab";
     public Image? Favicon;
+    public bool Pinned;
     /// <summary>Top-level page URL, used as the source when matching subresource requests.</summary>
     public string PageUrl = "";
     public bool AdblockOn = true;
@@ -22,6 +24,8 @@ sealed class BrowserTab
     public int Blocked;
     public bool Loading;
     public float Progress;
+    /// <summary>When the tab was last moved to the background (for sleeping tabs).</summary>
+    public DateTime HiddenSince = DateTime.UtcNow;
 }
 
 sealed class BrowserForm : Form
@@ -38,9 +42,9 @@ sealed class BrowserForm : Form
     // Logical (96-dpi) sizes of the window chrome.
     const int ToolbarHeight = 52, TabBarHeight = 32, CaptionWidth = 46;
 
-    readonly Settings _settings = Settings.Load();
-    readonly AdBlocker _adblock;
-    readonly Task<CoreWebView2Environment> _env;
+    static Settings _settings => Services.Settings;
+    static AdBlocker _adblock => Services.AdBlocker;
+
     readonly List<BrowserTab> _tabs = new();
     readonly Stack<(string Url, int Index)> _closedTabs = new();
     BrowserTab? _active;
@@ -50,6 +54,7 @@ sealed class BrowserForm : Form
     readonly GlyphButton _back, _forward, _newTab, _menu;
     readonly ShieldButton _shield = new();
     readonly AddressField _address;
+    readonly SuggestionPopup _suggestions = new();
     readonly CaptionButton _min = new(CaptionButton.Kind.Minimize);
     readonly CaptionButton _max = new(CaptionButton.Kind.Maximize);
     readonly CaptionButton _close = new(CaptionButton.Kind.Close);
@@ -57,41 +62,42 @@ sealed class BrowserForm : Form
     readonly Panel _separator = new();
     readonly Panel _content = new() { BackColor = Color.White };
     readonly MacMenu _menuStrip = new();
+    readonly MacMenu _tabMenu = new();
     readonly System.Windows.Forms.Timer _progressTimer = new() { Interval = 16 };
+    readonly System.Windows.Forms.Timer _sleepTimer = new() { Interval = 30_000 };
 
     bool _fullscreen;
     FormWindowState _preFullscreenState;
-    DnsHealth? _dnsHealth;
-    (bool On, string Server) _appliedDns;
-
     readonly IReadOnlyList<string> _startUrls;
 
-    public BrowserForm(IReadOnlyList<string>? startUrls = null)
+    /// <summary>
+    /// A private window keeps no history and no session, and its views use an in-memory profile
+    /// whose cookies and storage are thrown away when the window closes.
+    /// </summary>
+    public bool IsPrivate { get; }
+
+    public BrowserForm(IReadOnlyList<string> startUrls, bool isPrivate)
     {
-        _startUrls = startUrls ?? [];
-        Text = "Brisk";
+        _startUrls = startUrls;
+        IsPrivate = isPrivate;
+        Text = isPrivate ? "Private — Brisk" : "Brisk";
         AutoScaleMode = AutoScaleMode.None;
         Size = new Size(LogicalToDeviceUnits(1280), LogicalToDeviceUnits(820));
         MinimumSize = new Size(LogicalToDeviceUnits(520), LogicalToDeviceUnits(360));
-        StartPosition = FormStartPosition.CenterScreen;
+        StartPosition = isPrivate ? FormStartPosition.WindowsDefaultLocation : FormStartPosition.CenterScreen;
         Font = Theme.Ui(9f);
         Icon = LoadIcon();
-
-        _adblock = new AdBlocker(SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext());
-        _adblock.Updated += msg => { if (msg.StartsWith("Couldn't")) _tips.Show(msg, _shield, 0, _shield.Height, 4000); };
-        _adblock.Start();
-        _env = CreateEnvironment();
 
         _back = new GlyphButton(Glyphs.Back, "Back (Alt+Left)", _tips) { GlyphSize = 18 };
         _forward = new GlyphButton(Glyphs.Forward, "Forward (Alt+Right)", _tips) { GlyphSize = 18 };
         _newTab = new GlyphButton(Glyphs.Plus, "New Tab (Ctrl+T)", _tips) { GlyphSize = 15 };
         _menu = new GlyphButton(Glyphs.Ellipsis, "More", _tips) { GlyphSize = 17 };
-        _address = new AddressField(_tips);
+        _address = new AddressField(_tips) { Private = isPrivate };
         _tabBar = new TabBar(_tips);
 
         _back.Click += (_, _) => { if (_active?.View?.CanGoBack == true) _active.View.GoBack(); };
         _forward.Click += (_, _) => { if (_active?.View?.CanGoForward == true) _active.View.GoForward(); };
-        _newTab.Click += (_, _) => NewTab(_settings.HomePage, editAddress: true);
+        _newTab.Click += (_, _) => NewTab(StartPage.Url, editAddress: true);
         _menu.Click += (_, _) => ShowMenu();
         _shield.Click += (_, _) => ToggleAdblockForSite();
         _tips.SetToolTip(_shield, "Ad blocking for this site. Click to turn it off or on.");
@@ -101,17 +107,27 @@ sealed class BrowserForm : Form
             if (_active?.View is not { } v) return;
             if (_active.Loading) v.Stop(); else v.Reload();
         };
+        _address.BookmarkClicked += ToggleBookmark;
+        _address.EditTextChanged += ShowSuggestions;
+        _address.EditKeyDown += OnAddressKey;
+        _address.EditEnded += () => _suggestions.Hide();
+        _suggestions.Chosen += s => { _address.EndEdit(); Navigate(s.Url); };
         _min.Click += (_, _) => WindowState = FormWindowState.Minimized;
         _max.Click += (_, _) => WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized;
         _close.Click += (_, _) => Close();
         _tabBar.TabSelected += Activate;
         _tabBar.TabClosed += CloseTab;
+        _tabBar.TabMoved += MoveTab;
+        _tabBar.TabContextMenu += ShowTabMenu;
 
         foreach (var c in new Control[] { _back, _forward, _shield, _address, _newTab, _menu, _min, _max, _close })
             _toolbar.Controls.Add(c);
         Controls.AddRange([_toolbar, _tabBar, _separator, _content]);
 
         _progressTimer.Tick += (_, _) => AnimateProgress();
+        _sleepTimer.Tick += (_, _) => SleepIdleTabs();
+        Services.AdBlocker.Updated += OnFilterListsUpdated;
+        if (Services.DnsHealth is { } health) health.Changed += UpdateShield;
         UpdatePlaceholder();
         Theme.Changed += ApplyTheme;
         ApplyTheme();
@@ -120,10 +136,26 @@ sealed class BrowserForm : Form
     protected override void OnLoad(EventArgs e)
     {
         base.OnLoad(e);
-        DefaultBrowser.RefreshIfMoved();
+        if (!IsPrivate) DefaultBrowser.RefreshIfMoved();
         InstallWheelHook();
-        RestoreSession();
-        _ = RefreshScriptletsAsync();
+        if (IsPrivate)
+        {
+            foreach (var u in _startUrls) NewTab(u);
+            if (_tabs.Count == 0) NewTab(StartPage.Url);
+        }
+        else RestoreSession();
+        _sleepTimer.Start();
+        _ = Services.RefreshScriptletsAsync(Handle);
+        // The DNS check starts with the engine, which may finish after this window was created.
+        _ = Services.Environment.ContinueWith(_ =>
+        {
+            if (Services.DnsHealth is { } health) { health.Changed -= UpdateShield; health.Changed += UpdateShield; }
+        }, TaskScheduler.FromCurrentSynchronizationContext());
+    }
+
+    void OnFilterListsUpdated(string msg)
+    {
+        if (msg.StartsWith("Couldn't") && ContainsFocus) _tips.Show(msg, _shield, 0, _shield.Height, 4000);
     }
 
     protected override void OnHandleCreated(EventArgs e)
@@ -193,6 +225,13 @@ sealed class BrowserForm : Form
     {
         base.OnResize(e);
         _max.Invalidate();
+        _suggestions.Hide();
+    }
+
+    protected override void OnMove(EventArgs e)
+    {
+        base.OnMove(e);
+        _suggestions.Hide();
     }
 
     protected override void OnActivated(EventArgs e) { base.OnActivated(e); InvalidateCaption(); }
@@ -205,8 +244,9 @@ sealed class BrowserForm : Form
         base.OnLayout(e);
         if (_tabBar is null) return;
         var cs = ClientSize;
+        bool showTabs = _tabs.Count > 1 || _tabs.Any(t => t.Pinned);
         int toolbarH = _fullscreen ? 0 : LogicalToDeviceUnits(ToolbarHeight);
-        int tabsH = _fullscreen || _tabs.Count < 2 ? 0 : LogicalToDeviceUnits(TabBarHeight);
+        int tabsH = _fullscreen || !showTabs ? 0 : LogicalToDeviceUnits(TabBarHeight);
         int sepH = _fullscreen ? 0 : 1;
         _toolbar.SetBounds(0, 0, cs.Width, toolbarH);
         _tabBar.SetBounds(0, toolbarH, cs.Width, tabsH);
@@ -248,76 +288,13 @@ sealed class BrowserForm : Form
         _address.SetBounds(fx, (h - fieldH) / 2, fieldW, fieldH);
     }
 
-    // ---------- Engine ----------
-
-    async Task<CoreWebView2Environment> CreateEnvironment()
-    {
-        var args = new List<string>
-        {
-            // Never expose the local IP address through WebRTC.
-            "--force-webrtc-ip-handling-policy=default_public_interface_only",
-        };
-        var userDataDir = Path.Combine(Settings.DataDir, "Profile");
-        _appliedDns = (_settings.DnsBlocking, _settings.DnsServer);
-        await Task.Run(() => ConfigureSecureDns(userDataDir));
-        if (_settings.DnsBlocking)
-        {
-            _dnsHealth = new DnsHealth(_settings.DnsServer);
-            _dnsHealth.Changed += UpdateShield;
-            _dnsHealth.Start();
-        }
-        var port = Environment.GetEnvironmentVariable("BRISK_REMOTE_DEBUGGING_PORT");
-        if (int.TryParse(port, out var p)) args.Add($"--remote-debugging-port={p}");
-
-        var options = new CoreWebView2EnvironmentOptions(string.Join(' ', args))
-        {
-            EnableTrackingPrevention = true,
-            AreBrowserExtensionsEnabled = false,
-        };
-        return await CoreWebView2Environment.CreateAsync(null, userDataDir, options);
-    }
-
-    /// <summary>
-    /// The backup ad-blocking layer: resolve every hostname through an ad-blocking DNS-over-HTTPS
-    /// server. "automatic" mode falls back to the system resolver if that server is unreachable, so
-    /// an outage never stops pages loading (DnsHealth warns the user instead). WebView2 ignores the DoH feature
-    /// flags, but honours the same "Local State" preferences Chromium uses, so set them before the
-    /// browser process starts.
-    /// </summary>
-    void ConfigureSecureDns(string userDataDir)
-    {
-        var path = Path.Combine(userDataDir, "EBWebView", "Local State");
-        try
-        {
-            var state = File.Exists(path)
-                ? JsonNode.Parse(File.ReadAllText(path)) as JsonObject ?? new JsonObject()
-                : new JsonObject();
-            if (_settings.DnsBlocking)
-                state["dns_over_https"] = new JsonObject { ["mode"] = "automatic", ["templates"] = _settings.DnsServer };
-            else if (!state.Remove("dns_over_https"))
-                return;
-            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            File.WriteAllText(path, state.ToJsonString());
-        }
-        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException) { }
-    }
-
-    /// <summary>Rebuilds uBO's scriptlet resources in the background when they are missing or old.</summary>
-    async Task RefreshScriptletsAsync()
-    {
-        if (!AdBlocker.ResourcesStale) return;
-        var env = await _env;
-        await Task.Delay(TimeSpan.FromSeconds(3)); // let the first page get going first
-        var json = await ScriptletConverter.ConvertAsync(env, Handle);
-        if (json is not null) _adblock.SetResources(json);
-    }
-
     // ---------- Tabs ----------
 
     BrowserTab NewTab(string url, bool activate = true, bool editAddress = false, int? index = null)
     {
         var tab = new BrowserTab { Url = url, Title = TitleFor(url) };
-        _tabs.Insert(index ?? _tabs.Count, tab);
+        int pinned = _tabs.Count(t => t.Pinned);
+        _tabs.Insert(Math.Max(pinned, Math.Min(index ?? _tabs.Count, _tabs.Count)), tab);
         _tabBar.Tabs = _tabs;
         if (activate) Activate(tab);
         PerformLayout();
@@ -335,8 +312,17 @@ sealed class BrowserForm : Form
 
         // Tabs are created lazily: a restored tab costs nothing until it is first shown.
         if (tab.View is null) _ = EnsureView(tab, navigate: true);
-        else tab.View.Visible = true;
-        if (previous?.View is not null) previous.View.Visible = false;
+        else
+        {
+            tab.View.Visible = true; // also wakes a sleeping tab
+            if (tab.View.CoreWebView2 is { } core) core.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Normal;
+        }
+        if (previous?.View is not null)
+        {
+            previous.View.Visible = false;
+            previous.HiddenSince = DateTime.UtcNow;
+            if (previous.View.CoreWebView2 is { } prevCore) prevCore.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Low;
+        }
 
         tab.View?.BringToFront();
         _tabBar.Invalidate();
@@ -362,6 +348,41 @@ sealed class BrowserForm : Form
         _tabBar.Invalidate();
     }
 
+    void MoveTab(BrowserTab tab, int index)
+    {
+        _tabs.Remove(tab);
+        _tabs.Insert(Math.Clamp(index, 0, _tabs.Count), tab);
+        _tabBar.Invalidate();
+    }
+
+    void SetPinned(BrowserTab tab, bool pinned)
+    {
+        if (tab.Pinned == pinned) return;
+        _tabs.Remove(tab);
+        tab.Pinned = pinned;
+        // Pinned tabs live at the left; a newly pinned tab joins the end of that group.
+        _tabs.Insert(_tabs.Count(t => t.Pinned), tab);
+        PerformLayout();
+        _tabBar.Invalidate();
+    }
+
+    void ShowTabMenu(BrowserTab tab, Point at)
+    {
+        _tabMenu.Items.Clear();
+        _tabMenu.Items.Add(tab.Pinned ? "Unpin Tab" : "Pin Tab", null, (_, _) => SetPinned(tab, !tab.Pinned));
+        _tabMenu.Items.Add("Duplicate Tab", null, (_, _) => NewTab(tab.Url, index: _tabs.IndexOf(tab) + 1));
+        _tabMenu.Items.Add(new ToolStripSeparator());
+        _tabMenu.Items.Add("Close Tab", null, (_, _) => CloseTab(tab));
+        var others = new ToolStripMenuItem("Close Other Tabs", null, (_, _) =>
+        {
+            foreach (var t in _tabs.Where(t => t != tab && !t.Pinned).ToList()) CloseTab(t);
+        })
+        { Enabled = _tabs.Any(t => t != tab && !t.Pinned) };
+        _tabMenu.Items.Add(others);
+        _tabMenu.Show(_tabBar, at);
+        _tabMenu.Focus(); // take keyboard focus from the page, so Escape and the arrow keys reach the menu
+    }
+
     async Task EnsureView(BrowserTab tab, bool navigate)
     {
         if (tab.View is null)
@@ -382,8 +403,18 @@ sealed class BrowserForm : Form
 
     async Task InitView(BrowserTab tab, WebView2 view, bool navigate)
     {
-        var env = await _env;
-        await view.EnsureCoreWebView2Async(env);
+        var env = await Services.Environment;
+        if (IsPrivate)
+        {
+            var options = env.CreateCoreWebView2ControllerOptions();
+            options.IsInPrivateModeEnabled = true;
+            options.ProfileName = "Private";
+            await view.EnsureCoreWebView2Async(env, options);
+        }
+        else
+        {
+            await view.EnsureCoreWebView2Async(env);
+        }
         var core = view.CoreWebView2;
         HookAccelerators(view);
 
@@ -408,10 +439,11 @@ sealed class BrowserForm : Form
                 _ = RegisterScriptletsAsync(tab, core, frameUri.Host, script);
         };
         core.ContentLoading += (_, _) => { tab.Progress = Math.Max(tab.Progress, 0.45f); };
-        core.NavigationCompleted += (_, _) =>
+        core.NavigationCompleted += (_, e) =>
         {
             tab.Loading = false;
             tab.Progress = 1;
+            if (e.IsSuccess && !IsPrivate) Services.History.Record(core.Source, core.DocumentTitle);
             if (tab == _active) UpdateChrome();
         };
         core.SourceChanged += (_, _) => { tab.Url = core.Source; if (tab == _active) UpdateChrome(); };
@@ -419,8 +451,9 @@ sealed class BrowserForm : Form
         core.DocumentTitleChanged += (_, _) =>
         {
             tab.Title = string.IsNullOrWhiteSpace(core.DocumentTitle) ? TitleFor(core.Source) : core.DocumentTitle;
+            if (!IsPrivate) Services.History.UpdateTitle(core.Source, core.DocumentTitle);
             _tabBar.Invalidate();
-            if (tab == _active) Text = tab.Title + " â€” Brisk";
+            if (tab == _active) Text = WindowTitle(tab);
         };
         core.FaviconChanged += async (_, _) =>
         {
@@ -457,6 +490,27 @@ sealed class BrowserForm : Form
         core.WindowCloseRequested += (_, _) => CloseTab(tab);
 
         if (navigate) core.Navigate(tab.Url);
+    }
+
+    // ---------- Sleeping tabs ----------
+
+    /// <summary>
+    /// Suspends background tabs that haven't been looked at for a while: their scripts and timers
+    /// stop and the engine can reclaim their memory. Tabs playing audio are left alone. A sleeping
+    /// tab wakes by itself when it is shown again. (The engine refuses while DevTools remote
+    /// debugging is on, so BRISK_REMOTE_DEBUGGING_PORT test runs never see tabs sleep.)
+    /// </summary>
+    async void SleepIdleTabs()
+    {
+        if (_settings.SleepTabsAfterMinutes <= 0) return;
+        var limit = TimeSpan.FromMinutes(_settings.SleepTabsAfterMinutes);
+        foreach (var tab in _tabs.ToList())
+        {
+            if (tab == _active || tab.View?.CoreWebView2 is not { } core) continue;
+            if (core.IsSuspended || core.IsDocumentPlayingAudio || DateTime.UtcNow - tab.HiddenSince < limit) continue;
+            try { await core.TrySuspendAsync(); }
+            catch (Exception ex) when (ex is COMException or InvalidOperationException) { }
+        }
     }
 
     // ---------- Blocking ----------
@@ -499,7 +553,8 @@ sealed class BrowserForm : Form
     bool NeedsScriptlets(BrowserTab tab, Uri uri, out string script)
     {
         script = "";
-        if (!tab.AdblockOn || !_adblock.IsReady || uri.Scheme is not ("http" or "https") || tab.Scriptlets.ContainsKey(uri.Host))
+        if (!tab.AdblockOn || !_adblock.IsReady || uri.Scheme is not ("http" or "https") ||
+            StartPage.Is(uri.AbsoluteUri) || tab.Scriptlets.ContainsKey(uri.Host))
             return false;
         script = _adblock.InjectedScript(uri.AbsoluteUri);
         if (script.Length == 0) tab.Scriptlets[uri.Host] = null;
@@ -530,8 +585,18 @@ sealed class BrowserForm : Form
 
     void OnResourceRequested(BrowserTab tab, CoreWebView2Environment env, CoreWebView2WebResourceRequestedEventArgs e)
     {
-        if (!tab.AdblockOn || !_adblock.IsReady) return;
         var url = e.Request.Uri;
+
+        // The start page is generated here; it never goes to the network.
+        if (StartPage.Is(url))
+        {
+            var html = Encoding.UTF8.GetBytes(StartPage.Html(IsPrivate));
+            e.Response = env.CreateWebResourceResponse(new MemoryStream(html), 200, "OK",
+                "Content-Type: text/html; charset=utf-8\nCache-Control: no-store");
+            return;
+        }
+
+        if (!tab.AdblockOn || !_adblock.IsReady) return;
         if (!url.StartsWith("http", StringComparison.OrdinalIgnoreCase) && !url.StartsWith("ws", StringComparison.OrdinalIgnoreCase)) return;
 
         string type;
@@ -549,6 +614,7 @@ sealed class BrowserForm : Form
         {
             e.Response = env.CreateWebResourceResponse(null, 403, "Blocked", "");
             tab.Blocked++;
+            Services.BlockedTotal++;
             if (tab == _active) UpdateShield();
         }
     }
@@ -597,7 +663,7 @@ sealed class BrowserForm : Form
 
     void ToggleAdblockForSite()
     {
-        if (_active is null || !Uri.TryCreate(_active.Url, UriKind.Absolute, out var uri)) return;
+        if (_active is null || !Uri.TryCreate(_active.Url, UriKind.Absolute, out var uri) || StartPage.Is(_active.Url)) return;
         var key = Settings.SiteKey(uri);
         if (key.Length == 0) return;
         if (!_settings.AdblockDisabledSites.Remove(key)) _settings.AdblockDisabledSites.Add(key);
@@ -622,16 +688,48 @@ sealed class BrowserForm : Form
         return b.Uri.AbsoluteUri;
     }
 
+    // ---------- Bookmarks and suggestions ----------
+
+    void ToggleBookmark()
+    {
+        if (_active is null || !JsonFile.IsRecordable(_active.Url)) return;
+        _address.Bookmarked = Services.Bookmarks.Toggle(_active.Url, _active.Title);
+    }
+
+    void ShowSuggestions(string text)
+    {
+        var engine = _settings.CurrentSearchEngine?.Name ?? "the web";
+        var items = SuggestionSource.For(text, _settings.SearchUrl, engine, includeHistory: !IsPrivate);
+        _suggestions.ShowFor(this, _address.RectangleToScreen(_address.ClientRectangle), items);
+    }
+
+    bool OnAddressKey(Keys key)
+    {
+        switch (key)
+        {
+            case Keys.Down: return _suggestions.MoveSelection(1);
+            case Keys.Up: return _suggestions.MoveSelection(-1);
+            case Keys.Enter when _suggestions.Visible && _suggestions.Selected is { } chosen:
+                _address.EndEdit();
+                Navigate(chosen.Url);
+                return true;
+            default: return false;
+        }
+    }
+
     // ---------- Chrome ----------
+
+    string WindowTitle(BrowserTab tab) => (IsPrivate ? "Private — " : "") + tab.Title + " — Brisk";
 
     void UpdateChrome()
     {
         if (_active is null) return;
         _address.SetUrl(_active.Url);
         _address.Loading = _active.Loading;
+        _address.Bookmarked = Services.Bookmarks.Contains(_active.Url);
         _back.Enabled = _active.View?.CanGoBack == true;
         _forward.Enabled = _active.View?.CanGoForward == true;
-        Text = _active.Title + " â€” Brisk";
+        Text = WindowTitle(_active);
         UpdateShield();
         if (_active.Loading || _address.Progress > 0) _progressTimer.Start();
     }
@@ -639,8 +737,9 @@ sealed class BrowserForm : Form
     void UpdateShield()
     {
         if (_active is null) return;
-        _shield.SetState(_active.AdblockOn, _active.Blocked, _dnsHealth?.Unreachable == true);
-        _tips.SetToolTip(_shield, _dnsHealth?.Unreachable == true
+        bool dnsDown = Services.DnsHealth?.Unreachable == true;
+        _shield.SetState(_active.AdblockOn, _active.Blocked, dnsDown);
+        _tips.SetToolTip(_shield, dnsDown
             ? $"{_settings.DnsName} can't be reached, so Brisk is using your normal DNS for now. The main ad blocker still works."
             : "Ad blocking for this site. Click to turn it off or on.");
     }
@@ -666,9 +765,10 @@ sealed class BrowserForm : Form
         }
     }
 
-    void Go(string input)
+    void Go(string input) => Navigate(ToUrl(input));
+
+    void Navigate(string url)
     {
-        var url = ToUrl(input);
         if (_active is null) { NewTab(url); return; }
         _active.Url = url;
         _address.SetUrl(url);
@@ -680,7 +780,7 @@ sealed class BrowserForm : Form
     string ToUrl(string input)
     {
         input = input.Trim();
-        if (input.Length == 0) return _settings.HomePage;
+        if (input.Length == 0) return StartPage.Url;
         if (Uri.TryCreate(input, UriKind.Absolute, out var u) &&
             u.Scheme is "http" or "https" or "file" or "about" or "edge" or "data" or "view-source")
             return input;
@@ -702,16 +802,59 @@ sealed class BrowserForm : Form
             : "Search or enter website name";
 
     static string TitleFor(string url) =>
-        Uri.TryCreate(url, UriKind.Absolute, out var u) && u.Host.Length > 0 ? Settings.SiteKey(u) : "New Tab";
+        StartPage.Is(url) ? "Start Page"
+        : Uri.TryCreate(url, UriKind.Absolute, out var u) && u.Host.Length > 0 ? Settings.SiteKey(u)
+        : "New Tab";
+
+    static string MenuLabel(string text, int max = 48)
+    {
+        text = text.Replace("&", "&&");
+        return text.Length <= max ? text : text[..(max - 1)] + "…";
+    }
 
     void ShowMenu()
     {
         _menuStrip.Items.Clear();
-        _menuStrip.Items.Add(new ToolStripMenuItem("New Tab", null, (_, _) => NewTab(_settings.HomePage, editAddress: true))
+        _menuStrip.Items.Add(new ToolStripMenuItem("New Tab", null, (_, _) => NewTab(StartPage.Url, editAddress: true))
         { ShortcutKeyDisplayString = "Ctrl+T" });
+        _menuStrip.Items.Add(new ToolStripMenuItem("New Private Window", null, (_, _) => BriskContext.Current.OpenPrivateWindow())
+        { ShortcutKeyDisplayString = "Ctrl+Shift+N" });
         _menuStrip.Items.Add(new ToolStripSeparator());
 
-        var site = _active is not null && Uri.TryCreate(_active.Url, UriKind.Absolute, out var u) ? Settings.SiteKey(u) : "";
+        // Bookmarks
+        var bookmarks = new ToolStripMenuItem("Bookmarks");
+        if (_active is not null && JsonFile.IsRecordable(_active.Url))
+        {
+            bool marked = Services.Bookmarks.Contains(_active.Url);
+            bookmarks.DropDownItems.Add(new ToolStripMenuItem(marked ? "Remove Bookmark" : "Bookmark This Page", null, (_, _) => ToggleBookmark())
+            { ShortcutKeyDisplayString = "Ctrl+D" });
+        }
+        if (Services.Bookmarks.Items.Count > 0)
+        {
+            if (bookmarks.DropDownItems.Count > 0) bookmarks.DropDownItems.Add(new ToolStripSeparator());
+            foreach (var b in Services.Bookmarks.Items.Reverse().Take(30))
+                bookmarks.DropDownItems.Add(MenuLabel(b.Title), null, (_, _) => Navigate(b.Url));
+        }
+        if (bookmarks.DropDownItems.Count == 0) bookmarks.DropDownItems.Add(new ToolStripMenuItem("No Bookmarks Yet") { Enabled = false });
+        _menuStrip.Items.Add(bookmarks);
+
+        // History
+        if (!IsPrivate)
+        {
+            var history = new ToolStripMenuItem("History");
+            foreach (var h in Services.History.Recent(20))
+                history.DropDownItems.Add(MenuLabel(string.IsNullOrWhiteSpace(h.Title) ? h.Url : h.Title), null, (_, _) => Navigate(h.Url));
+            if (history.DropDownItems.Count == 0) history.DropDownItems.Add(new ToolStripMenuItem("No History Yet") { Enabled = false });
+            else
+            {
+                history.DropDownItems.Add(new ToolStripSeparator());
+                history.DropDownItems.Add("Clear History", null, (_, _) => Services.History.Clear());
+            }
+            _menuStrip.Items.Add(history);
+        }
+        _menuStrip.Items.Add(new ToolStripSeparator());
+
+        var site = _active is not null && !StartPage.Is(_active.Url) && Uri.TryCreate(_active.Url, UriKind.Absolute, out var u) ? Settings.SiteKey(u) : "";
         if (site.Length > 0)
         {
             var item = new ToolStripMenuItem($"Block Ads on {site}") { Checked = _active!.AdblockOn };
@@ -735,9 +878,10 @@ sealed class BrowserForm : Form
         AddDns("Off", false, "");
         foreach (var provider in Settings.DnsProviders) AddDns(provider.Name, true, provider.Url);
         _menuStrip.Items.Add(dns);
-        if ((_settings.DnsBlocking, _settings.DnsServer) != _appliedDns && (_settings.DnsBlocking || _appliedDns.On))
+        var applied = Services.AppliedDns;
+        if ((_settings.DnsBlocking, _settings.DnsServer) != applied && (_settings.DnsBlocking || applied.On))
             _menuStrip.Items.Add(new ToolStripMenuItem("Restart Brisk to Apply the DNS Change") { Enabled = false });
-        else if (_dnsHealth?.Unreachable == true)
+        else if (Services.DnsHealth?.Unreachable == true)
             _menuStrip.Items.Add(new ToolStripMenuItem($"{_settings.DnsName} Is Unreachable, Using Normal DNS") { Enabled = false });
         _menuStrip.Items.Add("Update Filter Lists", null, (_, _) => _adblock.UpdateLists());
         _menuStrip.Items.Add(new ToolStripSeparator());
@@ -750,6 +894,15 @@ sealed class BrowserForm : Form
             engines.DropDownItems.Add(item);
         }
         _menuStrip.Items.Add(engines);
+
+        var sleep = new ToolStripMenuItem("Sleeping Tabs");
+        foreach (var (label, minutes) in new[] { ("After 5 Minutes", 5.0), ("After 10 Minutes", 10.0), ("After 30 Minutes", 30.0), ("After 1 Hour", 60.0), ("Never", 0.0) })
+        {
+            var item = new ToolStripMenuItem(label) { Checked = Math.Abs(_settings.SleepTabsAfterMinutes - minutes) < 0.01 };
+            item.Click += (_, _) => { _settings.SleepTabsAfterMinutes = minutes; _settings.Save(); };
+            sleep.DropDownItems.Add(item);
+        }
+        _menuStrip.Items.Add(sleep);
 
         if (_settings.AdblockDisabledSites.Count > 0)
         {
@@ -780,6 +933,7 @@ sealed class BrowserForm : Form
         _menuStrip.Items.Add("About Brisk", null, (_, _) => { using var about = new AboutForm(Icon); about.ShowDialog(this); });
         var size = _menuStrip.GetPreferredSize(Size.Empty);
         _menuStrip.Show(_menu, new Point(_menu.Width - size.Width, _menu.Height + LogicalToDeviceUnits(6)));
+        _menuStrip.Focus(); // take keyboard focus from the page, so Escape and the arrow keys reach the menu
     }
 
     void SetFullscreen(bool on)
@@ -828,10 +982,12 @@ sealed class BrowserForm : Form
     {
         switch (keyData)
         {
-            case Keys.Control | Keys.T: NewTab(_settings.HomePage, editAddress: true); return true;
+            case Keys.Control | Keys.T: NewTab(StartPage.Url, editAddress: true); return true;
+            case Keys.Control | Keys.Shift | Keys.N: BriskContext.Current.OpenPrivateWindow(); return true;
             case Keys.Control | Keys.W:
             case Keys.Control | Keys.F4: if (_active is not null) CloseTab(_active); return true;
             case Keys.Control | Keys.Shift | Keys.T: ReopenClosedTab(); return true;
+            case Keys.Control | Keys.D: ToggleBookmark(); return true;
             case Keys.Control | Keys.L:
             case Keys.Alt | Keys.D:
             case Keys.F6: _address.BeginEdit(); return true;
@@ -937,11 +1093,16 @@ sealed class BrowserForm : Form
     void RestoreSession()
     {
         var urls = _settings.SessionTabs.Where(u => !string.IsNullOrWhiteSpace(u)).ToList();
-        foreach (var u in urls) NewTab(u, activate: false);
+        for (int i = 0; i < urls.Count; i++)
+        {
+            var tab = NewTab(urls[i], activate: false);
+            if (i < _settings.SessionPinned) tab.Pinned = true;
+        }
         // Links Brisk was started with (e.g. clicked in another app) open after the restored tabs.
         foreach (var u in _startUrls) NewTab(u);
-        if (_tabs.Count == 0) NewTab(_settings.HomePage);
+        if (_tabs.Count == 0) NewTab(StartPage.Url);
         else if (_startUrls.Count == 0) Activate(_tabs[Math.Clamp(_settings.SessionActiveTab, 0, _tabs.Count - 1)]);
+        PerformLayout();
     }
 
     /// <summary>Called when Brisk is launched again while running: opens the links and comes to the front.</summary>
@@ -955,9 +1116,13 @@ sealed class BrowserForm : Form
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
-        _settings.SessionTabs = _tabs.Select(t => t.Url).ToList();
-        _settings.SessionActiveTab = _active is null ? 0 : _tabs.IndexOf(_active);
-        _settings.Save();
+        if (!IsPrivate)
+        {
+            _settings.SessionTabs = _tabs.Select(t => t.Url).ToList();
+            _settings.SessionPinned = _tabs.Count(t => t.Pinned);
+            _settings.SessionActiveTab = _active is null ? 0 : _tabs.IndexOf(_active);
+            _settings.Save();
+        }
         base.OnFormClosing(e);
     }
 
@@ -966,10 +1131,12 @@ sealed class BrowserForm : Form
         if (disposing)
         {
             Theme.Changed -= ApplyTheme;
+            Services.AdBlocker.Updated -= OnFilterListsUpdated;
+            if (Services.DnsHealth is { } health) health.Changed -= UpdateShield;
             if (_wheelHook != IntPtr.Zero) UnhookWindowsHookEx(_wheelHook);
             _progressTimer.Dispose();
-            _dnsHealth?.Dispose();
-            _adblock.Dispose();
+            _sleepTimer.Dispose();
+            _suggestions.Dispose();
         }
         base.Dispose(disposing);
     }
