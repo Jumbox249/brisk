@@ -15,7 +15,7 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
-    <Version>0.2.0</Version>
+    <Version>0.3.0</Version>
     <Product>Brisk</Product>
     <ApplicationIcon>..\..\assets\brisk.ico</ApplicationIcon>
     <!-- The WebView2 package drags in its WPF assembly; Brisk only uses WinForms. -->

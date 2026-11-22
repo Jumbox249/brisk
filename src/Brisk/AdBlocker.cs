@@ -38,10 +38,19 @@ sealed partial class AdBlocker : IDisposable
         "https://ublockorigin.github.io/uAssets/filters/quick-fixes.txt",
     ];
 
+    /// <summary>Cookie-consent banners and pop-ups (hidden or declined), used when Hide Cookie Banners is on.</summary>
+    static readonly string[] CookieLists =
+    [
+        "https://secure.fanboy.co.nz/fanboy-cookiemonster.txt",
+        "https://ublockorigin.github.io/uAssets/filters/annoyances-cookies.txt",
+    ];
+
     static readonly TimeSpan RefreshAfter = TimeSpan.FromDays(4);
     static readonly string CacheDir = Path.Combine(Settings.DataDir, "adblock");
-    // Bump the name whenever FilterLists changes, so existing installs rebuild with the new lists.
-    static readonly string EnginePath = Path.Combine(CacheDir, "engine-v2.dat");
+    // Bump the names whenever the lists change, so existing installs rebuild with the new lists.
+    // Each cookie-banner setting has its own cached engine, so switching back and forth is instant.
+    static string EnginePath => Path.Combine(CacheDir, Services.Settings.HideCookieBanners ? "engine-v3.dat" : "engine-v3-basic.dat");
+    static IEnumerable<string> Lists => Services.Settings.HideCookieBanners ? FilterLists.Concat(CookieLists) : FilterLists;
     static readonly string ResourcesPath = Path.Combine(CacheDir, "scriptlets.json");
     static readonly TimeSpan ResourcesRefreshAfter = TimeSpan.FromDays(7);
 
@@ -92,12 +101,13 @@ sealed partial class AdBlocker : IDisposable
     /// <summary>Loads the cached engine (fast) and schedules a list refresh if it is stale or missing.</summary>
     public void Start()
     {
+        var path = EnginePath;
         Task.Run(() =>
         {
             IntPtr loaded = IntPtr.Zero;
             try
             {
-                if (File.Exists(EnginePath)) loaded = Deserialize(File.ReadAllBytes(EnginePath));
+                if (File.Exists(path)) loaded = Deserialize(File.ReadAllBytes(path));
             }
             catch (IOException) { }
             ApplyResources(loaded);
@@ -105,16 +115,30 @@ sealed partial class AdBlocker : IDisposable
             if (loaded != IntPtr.Zero) _ui.Post(_ => Swap(loaded), null);
 
             var stale = loaded == IntPtr.Zero ||
-                        DateTime.UtcNow - File.GetLastWriteTimeUtc(EnginePath) > RefreshAfter;
+                        DateTime.UtcNow - File.GetLastWriteTimeUtc(path) > RefreshAfter;
             if (stale) _ui.Post(_ => UpdateLists(), null);
         });
     }
+
+    /// <summary>Switches to the engine for the current settings (after Hide Cookie Banners changed).</summary>
+    public void Reload()
+    {
+        if (_updating) { _reloadAfterUpdate = true; return; }
+        Start();
+    }
+
+    bool _reloadAfterUpdate;
+
+    /// <summary>When the filter lists were last downloaded, or null if never.</summary>
+    public static DateTime? LastUpdated => File.Exists(EnginePath) ? File.GetLastWriteTime(EnginePath) : null;
 
     /// <summary>Downloads the filter lists, rebuilds the engine off the UI thread and swaps it in.</summary>
     public void UpdateLists()
     {
         if (_updating) return;
         _updating = true;
+        var path = EnginePath;
+        var urls = Lists.ToArray();
         Task.Run(async () =>
         {
             string message;
@@ -122,16 +146,16 @@ sealed partial class AdBlocker : IDisposable
             {
                 using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
                 http.DefaultRequestHeaders.UserAgent.ParseAdd("Brisk/0.1");
-                var lists = await Task.WhenAll(FilterLists.Select(u => http.GetStringAsync(u)));
+                var lists = await Task.WhenAll(urls.Select(u => http.GetStringAsync(u)));
                 var rules = Encoding.UTF8.GetBytes(string.Join('\n', lists));
 
                 var engine = Build(rules);
                 ApplyResources(engine);
 
                 Directory.CreateDirectory(CacheDir);
-                var tmp = EnginePath + ".tmp";
+                var tmp = path + ".tmp";
                 File.WriteAllBytes(tmp, Serialize(engine));
-                File.Move(tmp, EnginePath, overwrite: true);
+                File.Move(tmp, path, overwrite: true);
 
                 _ui.Post(_ => Swap(engine), null);
                 message = "Filter lists updated.";
@@ -140,7 +164,13 @@ sealed partial class AdBlocker : IDisposable
             {
                 message = "Couldn't update filter lists: " + ex.Message;
             }
-            _ui.Post(_ => { _updating = false; Updated?.Invoke(message); }, null);
+            _ui.Post(_ =>
+            {
+                _updating = false;
+                Updated?.Invoke(message);
+                // The setting changed while this update ran: load (or build) the engine it wants now.
+                if (_reloadAfterUpdate || path != EnginePath) { _reloadAfterUpdate = false; Start(); }
+            }, null);
         });
     }
 

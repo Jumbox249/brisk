@@ -60,6 +60,18 @@ static class DefaultBrowser
         SHChangeNotify(0x08000000 /* SHCNE_ASSOCCHANGED */, 0, IntPtr.Zero, IntPtr.Zero);
     }
 
+    /// <summary>Removes everything <see cref="Register"/> added (used by the uninstaller).</summary>
+    public static void Unregister()
+    {
+        using var hkcu = Registry.CurrentUser;
+        hkcu.DeleteSubKeyTree($@"Software\Classes\{UrlProgId}", throwOnMissingSubKey: false);
+        hkcu.DeleteSubKeyTree($@"Software\Classes\{HtmlProgId}", throwOnMissingSubKey: false);
+        hkcu.DeleteSubKeyTree(ClientKey, throwOnMissingSubKey: false);
+        using (var registered = hkcu.OpenSubKey(@"Software\RegisteredApplications", writable: true))
+            registered?.DeleteValue(AppName, throwOnMissingValue: false);
+        SHChangeNotify(0x08000000 /* SHCNE_ASSOCCHANGED */, 0, IntPtr.Zero, IntPtr.Zero);
+    }
+
     /// <summary>
     /// Re-points the registration at this copy if the registered one no longer exists (Brisk was
     /// moved). Another copy that still exists keeps the registration.

@@ -63,6 +63,7 @@ sealed class BrowserForm : Form
     readonly Panel _content = new() { BackColor = Color.White };
     readonly MacMenu _menuStrip = new();
     readonly MacMenu _tabMenu = new();
+    readonly FindBar _find;
     readonly System.Windows.Forms.Timer _progressTimer = new() { Interval = 16 };
     readonly System.Windows.Forms.Timer _sleepTimer = new() { Interval = 30_000 };
 
@@ -94,6 +95,11 @@ sealed class BrowserForm : Form
         _menu = new GlyphButton(Glyphs.Ellipsis, "More", _tips) { GlyphSize = 17 };
         _address = new AddressField(_tips) { Private = isPrivate };
         _tabBar = new TabBar(_tips);
+        _find = new FindBar(_tips) { Visible = false };
+        _find.QueryChanged += q => _ = FindAsync(q);
+        _find.Next += () => FindStep(1);
+        _find.Previous += () => FindStep(-1);
+        _find.Closed += CloseFind;
 
         _back.Click += (_, _) => { if (_active?.View?.CanGoBack == true) _active.View.GoBack(); };
         _forward.Click += (_, _) => { if (_active?.View?.CanGoForward == true) _active.View.GoForward(); };
@@ -101,6 +107,9 @@ sealed class BrowserForm : Form
         _menu.Click += (_, _) => ShowMenu();
         _shield.Click += (_, _) => ToggleAdblockForSite();
         _tips.SetToolTip(_shield, "Ad blocking for this site. Click to turn it off or on.");
+        _shield.AccessibleName = "Ad blocking";
+        _shield.AccessibleRole = AccessibleRole.PushButton;
+        _address.AccessibleName = "Address";
         _address.Submitted += Go;
         _address.ReloadClicked += () =>
         {
@@ -122,7 +131,7 @@ sealed class BrowserForm : Form
 
         foreach (var c in new Control[] { _back, _forward, _shield, _address, _newTab, _menu, _min, _max, _close })
             _toolbar.Controls.Add(c);
-        Controls.AddRange([_toolbar, _tabBar, _separator, _content]);
+        Controls.AddRange([_toolbar, _tabBar, _separator, _find, _content]);
 
         _progressTimer.Tick += (_, _) => AnimateProgress();
         _sleepTimer.Tick += (_, _) => SleepIdleTabs();
@@ -252,7 +261,9 @@ sealed class BrowserForm : Form
         _tabBar.SetBounds(0, toolbarH, cs.Width, tabsH);
         _tabBar.Visible = tabsH > 0;
         _separator.SetBounds(0, toolbarH + tabsH, cs.Width, sepH);
-        int top = toolbarH + tabsH + sepH;
+        int findH = _find.Visible && !_fullscreen ? LogicalToDeviceUnits(40) : 0;
+        _find.SetBounds(0, toolbarH + tabsH + sepH, cs.Width, findH);
+        int top = toolbarH + tabsH + sepH + findH;
         _content.SetBounds(0, top, cs.Width, Math.Max(0, cs.Height - top));
         LayoutToolbar();
     }
@@ -327,6 +338,11 @@ sealed class BrowserForm : Form
         tab.View?.BringToFront();
         _tabBar.Invalidate();
         UpdateChrome();
+        if (_find.Visible)
+        {
+            if (previous?.View?.CoreWebView2 is { } prev) prev.Find.Stop();
+            _ = FindAsync(_find.Query);
+        }
         if (!_address.Editing) tab.View?.Focus();
     }
 
@@ -419,7 +435,10 @@ sealed class BrowserForm : Form
         HookAccelerators(view);
 
         var s = core.Settings;
-        s.IsPasswordAutosaveEnabled = false;
+        // Chromium's own password manager: it asks before saving, fills the login form next time,
+        // and keeps the passwords encrypted with your Windows account (DPAPI) in the profile.
+        s.IsPasswordAutosaveEnabled = !IsPrivate && _settings.SavePasswords;
+        if (!IsPrivate) Services.Profile ??= core.Profile;
         s.IsGeneralAutofillEnabled = false;
         s.IsReputationCheckingRequired = false; // SmartScreen sends visited URLs to Microsoft.
         s.IsStatusBarEnabled = true;
@@ -439,6 +458,8 @@ sealed class BrowserForm : Form
                 _ = RegisterScriptletsAsync(tab, core, frameUri.Host, script);
         };
         core.ContentLoading += (_, _) => { tab.Progress = Math.Max(tab.Progress, 0.45f); };
+        core.Find.MatchCountChanged += (_, _) => { if (tab == _active) ShowFindCount(core); };
+        core.Find.ActiveMatchIndexChanged += (_, _) => { if (tab == _active) ShowFindCount(core); };
         core.NavigationCompleted += (_, e) =>
         {
             tab.Loading = false;
@@ -596,7 +617,13 @@ sealed class BrowserForm : Form
             return;
         }
 
-        if (!tab.AdblockOn || !_adblock.IsReady) return;
+        if (!tab.AdblockOn)
+        {
+            // Ad blocking is off here: let requests through the ad-blocking DNS too.
+            if (DnsBypass.Applies(url)) DnsBypass.Handle(env, e);
+            return;
+        }
+        if (!_adblock.IsReady) return;
         if (!url.StartsWith("http", StringComparison.OrdinalIgnoreCase) && !url.StartsWith("ws", StringComparison.OrdinalIgnoreCase)) return;
 
         string type;
@@ -659,6 +686,89 @@ sealed class BrowserForm : Form
             }
         }
         catch (JsonException) { }
+    }
+
+    internal void ApplyPasswordSetting()
+    {
+        foreach (var t in _tabs)
+            if (t.View?.CoreWebView2 is { } core) core.Settings.IsPasswordAutosaveEnabled = !IsPrivate && _settings.SavePasswords;
+    }
+
+    /// <summary>Called by the Settings window after a setting that affects open windows changed.</summary>
+    internal void SettingsChanged() => UpdatePlaceholder();
+
+    /// <summary>Called by the Settings window when ad blocking was turned back on for a site.</summary>
+    internal void AdblockTurnedOnFor(string site)
+    {
+        ForgetScriptlets(site);
+        foreach (var t in _tabs.Where(t => TitleFor(t.Url) == site)) { t.AdblockOn = true; t.View?.Reload(); }
+        UpdateShield();
+    }
+
+    // ---------- Find in page ----------
+
+    void OpenFind()
+    {
+        if (_active is null) return;
+        if (!_find.Visible)
+        {
+            _find.Visible = true;
+            PerformLayout();
+            if (_find.Query.Length > 0) _ = FindAsync(_find.Query);
+        }
+        _find.FocusField();
+    }
+
+    void CloseFind()
+    {
+        if (!_find.Visible) return;
+        _active?.View?.CoreWebView2?.Find.Stop();
+        _find.Visible = false;
+        _find.Count = "";
+        PerformLayout();
+        _active?.View?.Focus();
+    }
+
+    async Task FindAsync(string query)
+    {
+        if (_active?.View?.CoreWebView2 is not { } core) return;
+        if (query.Length == 0) { core.Find.Stop(); _find.Count = ""; return; }
+        var env = await Services.Environment;
+        var options = env.CreateFindOptions();
+        options.FindTerm = query;
+        options.SuppressDefaultFindDialog = true;
+        options.ShouldHighlightAllMatches = true;
+        try
+        {
+            await core.Find.StartAsync(options);
+            ShowFindCount(core);
+        }
+        catch (Exception ex) when (ex is COMException or InvalidOperationException) { }
+    }
+
+    void FindStep(int dir)
+    {
+        if (_active?.View?.CoreWebView2 is not { } core || _find.Query.Length == 0) return;
+        if (dir > 0) core.Find.FindNext(); else core.Find.FindPrevious();
+    }
+
+    void ShowFindCount(CoreWebView2 core)
+    {
+        if (!_find.Visible || _find.Query.Length == 0) { _find.Count = ""; return; }
+        int count = core.Find.MatchCount, index = core.Find.ActiveMatchIndex;
+        _find.Count = count <= 0 ? "Not found" : $"{Math.Max(1, index)} of {count}";
+    }
+
+    // ---------- Tab search ----------
+
+    void ShowTabSearch()
+    {
+        if (_tabs.Count == 0) return;
+        var entries = _tabs.Select(t => new TabSearch.Entry(t, t.Title, StartPage.Is(t.Url) ? "" : t.Url, t.Favicon, t == _active)).ToList();
+        var popup = new TabSearch(entries);
+        popup.Chosen += tab => Activate((BrowserTab)tab);
+        popup.FormClosed += (_, _) => popup.Dispose();
+        popup.ShowUnder(this, _toolbar.Height + LogicalToDeviceUnits(4));
     }
 
     void ToggleAdblockForSite()
@@ -861,75 +971,12 @@ sealed class BrowserForm : Form
             item.Click += (_, _) => ToggleAdblockForSite();
             _menuStrip.Items.Add(item);
         }
-
-        var dns = new ToolStripMenuItem("Ad-Blocking DNS");
-        void AddDns(string name, bool on, string server)
-        {
-            bool current = _settings.DnsBlocking == on && (!on || _settings.DnsServer == server);
-            var item = new ToolStripMenuItem(name) { Checked = current };
-            item.Click += (_, _) =>
-            {
-                _settings.DnsBlocking = on;
-                if (on) _settings.DnsServer = server;
-                _settings.Save();
-            };
-            dns.DropDownItems.Add(item);
-        }
-        AddDns("Off", false, "");
-        foreach (var provider in Settings.DnsProviders) AddDns(provider.Name, true, provider.Url);
-        _menuStrip.Items.Add(dns);
-        var applied = Services.AppliedDns;
-        if ((_settings.DnsBlocking, _settings.DnsServer) != applied && (_settings.DnsBlocking || applied.On))
-            _menuStrip.Items.Add(new ToolStripMenuItem("Restart Brisk to Apply the DNS Change") { Enabled = false });
-        else if (Services.DnsHealth?.Unreachable == true)
-            _menuStrip.Items.Add(new ToolStripMenuItem($"{_settings.DnsName} Is Unreachable, Using Normal DNS") { Enabled = false });
-        _menuStrip.Items.Add("Update Filter Lists", null, (_, _) => _adblock.UpdateLists());
+        _menuStrip.Items.Add(new ToolStripMenuItem("Find on Page…", null, (_, _) => OpenFind()) { ShortcutKeyDisplayString = "Ctrl+F" });
+        _menuStrip.Items.Add(new ToolStripMenuItem("Search Tabs…", null, (_, _) => ShowTabSearch()) { ShortcutKeyDisplayString = "Ctrl+Shift+A" });
         _menuStrip.Items.Add(new ToolStripSeparator());
-
-        var engines = new ToolStripMenuItem("Search Engine");
-        foreach (var engine in Settings.SearchEngines)
-        {
-            var item = new ToolStripMenuItem(engine.Name) { Checked = _settings.CurrentSearchEngine == engine };
-            item.Click += (_, _) => { _settings.UseSearchEngine(engine); UpdatePlaceholder(); };
-            engines.DropDownItems.Add(item);
-        }
-        _menuStrip.Items.Add(engines);
-
-        var sleep = new ToolStripMenuItem("Sleeping Tabs");
-        foreach (var (label, minutes) in new[] { ("After 5 Minutes", 5.0), ("After 10 Minutes", 10.0), ("After 30 Minutes", 30.0), ("After 1 Hour", 60.0), ("Never", 0.0) })
-        {
-            var item = new ToolStripMenuItem(label) { Checked = Math.Abs(_settings.SleepTabsAfterMinutes - minutes) < 0.01 };
-            item.Click += (_, _) => { _settings.SleepTabsAfterMinutes = minutes; _settings.Save(); };
-            sleep.DropDownItems.Add(item);
-        }
-        _menuStrip.Items.Add(sleep);
-
-        if (_settings.AdblockDisabledSites.Count > 0)
-        {
-            var allowed = new ToolStripMenuItem("Sites with Ad Blocking Off");
-            foreach (var s in _settings.AdblockDisabledSites.Order())
-            {
-                allowed.DropDownItems.Add($"Turn Back On for {s}", null, (_, _) =>
-                {
-                    _settings.AdblockDisabledSites.Remove(s);
-                    _settings.Save();
-                    ForgetScriptlets(s);
-                    foreach (var t in _tabs.Where(t => TitleFor(t.Url) == s)) { t.AdblockOn = true; t.View?.Reload(); }
-                    UpdateShield();
-                });
-            }
-            _menuStrip.Items.Add(allowed);
-        }
-
-        _menuStrip.Items.Add(new ToolStripSeparator());
-        if (DefaultBrowser.IsDefault())
-            _menuStrip.Items.Add(new ToolStripMenuItem("Brisk Is Your Default Browser") { Enabled = false });
-        else
-            _menuStrip.Items.Add("Make Brisk Your Default Browser…", null, (_, _) =>
-            {
-                DefaultBrowser.Register();
-                DefaultBrowser.OpenSettings();
-            });
+        if (!IsPrivate)
+            _menuStrip.Items.Add("Passwords…", null, (_, _) => SettingsForm.ShowFor(this, "Passwords"));
+        _menuStrip.Items.Add(new ToolStripMenuItem("Settings…", null, (_, _) => SettingsForm.ShowFor(this)) { ShortcutKeyDisplayString = "Ctrl+," });
         _menuStrip.Items.Add("About Brisk", null, (_, _) => { using var about = new AboutForm(Icon); about.ShowDialog(this); });
         var size = _menuStrip.GetPreferredSize(Size.Empty);
         _menuStrip.Show(_menu, new Point(_menu.Width - size.Width, _menu.Height + LogicalToDeviceUnits(6)));
@@ -1000,6 +1047,13 @@ sealed class BrowserForm : Form
             case Keys.Alt | Keys.Left: _back.PerformClick(); return true;
             case Keys.Alt | Keys.Right: _forward.PerformClick(); return true;
             case Keys.F11: SetFullscreen(!_fullscreen); return true;
+            case Keys.Control | Keys.F: OpenFind(); return true;
+            case Keys.Control | Keys.G:
+            case Keys.F3: if (_find.Visible) FindStep(1); else OpenFind(); return true;
+            case Keys.Control | Keys.Shift | Keys.G:
+            case Keys.Shift | Keys.F3: if (_find.Visible) FindStep(-1); else OpenFind(); return true;
+            case Keys.Control | Keys.Shift | Keys.A: ShowTabSearch(); return true;
+            case Keys.Control | Keys.Oemcomma: SettingsForm.ShowFor(this); return true;
         }
         if (keyData >= (Keys.Control | Keys.D1) && keyData <= (Keys.Control | Keys.D9) && _tabs.Count > 0)
         {

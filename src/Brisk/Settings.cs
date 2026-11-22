@@ -66,6 +66,12 @@ sealed class Settings
     /// <summary>Background tabs are suspended after this many minutes; 0 turns it off.</summary>
     public double SleepTabsAfterMinutes { get; set; } = 10;
 
+    /// <summary>Offer to save passwords and fill them in on the next visit (never in private windows).</summary>
+    public bool SavePasswords { get; set; } = true;
+
+    /// <summary>Hide cookie-consent banners with the cookie notice filter lists.</summary>
+    public bool HideCookieBanners { get; set; } = true;
+
     public static string SiteKey(Uri? uri)
     {
         if (uri is null || string.IsNullOrEmpty(uri.Host)) return "";

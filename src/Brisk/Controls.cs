@@ -282,6 +282,9 @@ sealed class GlyphButton : ChromeControl
     {
         _paint = paint;
         tips.SetToolTip(this, tip);
+        // Screen readers (and UI Automation) name the button by its tooltip, without the shortcut.
+        AccessibleName = tip.Split(" (")[0];
+        AccessibleRole = AccessibleRole.PushButton;
     }
 
     public void PerformClick() { if (Enabled) OnClick(EventArgs.Empty); }

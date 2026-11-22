@@ -21,6 +21,11 @@ static class Program
             DefaultBrowser.Register();
             return;
         }
+        if (args.Contains("--unregister-default-browser"))
+        {
+            DefaultBrowser.Unregister();
+            return;
+        }
 
         var urls = args.Select(DefaultBrowser.ToUrl).OfType<string>().ToList();
         bool privateWindow = args.Contains(PrivateSwitch);

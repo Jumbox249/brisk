@@ -18,6 +18,9 @@ static class Services
     public static Task<CoreWebView2Environment> Environment { get; private set; } = null!;
     public static DnsHealth? DnsHealth { get; private set; }
 
+    /// <summary>The normal (non-private) browsing profile, once a normal tab has started; used for saved passwords.</summary>
+    public static CoreWebView2Profile? Profile { get; set; }
+
     /// <summary>The DNS setup the running browser engine was started with (changes need a restart).</summary>
     public static (bool On, string Server) AppliedDns { get; private set; }
 
