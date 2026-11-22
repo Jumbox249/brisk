@@ -40,6 +40,7 @@ sealed class BrowserForm : Form
     readonly AdBlocker _adblock;
     readonly Task<CoreWebView2Environment> _env;
     readonly List<BrowserTab> _tabs = new();
+    readonly Stack<(string Url, int Index)> _closedTabs = new();
     BrowserTab? _active;
 
     readonly ToolTip _tips = new();
@@ -112,6 +113,7 @@ sealed class BrowserForm : Form
     protected override void OnLoad(EventArgs e)
     {
         base.OnLoad(e);
+        InstallWheelHook();
         RestoreSession();
     }
 
@@ -320,6 +322,7 @@ sealed class BrowserForm : Form
         var i = _tabs.IndexOf(tab);
         if (i < 0) return;
         if (_tabs.Count == 1) { Close(); return; }
+        if (!string.IsNullOrEmpty(tab.Url)) _closedTabs.Push((tab.Url, i));
         _tabs.RemoveAt(i);
         if (_active == tab)
         {
@@ -355,6 +358,7 @@ sealed class BrowserForm : Form
         var env = await _env;
         await view.EnsureCoreWebView2Async(env);
         var core = view.CoreWebView2;
+        HookAccelerators(view);
 
         var s = core.Settings;
         s.IsPasswordAutosaveEnabled = false;
@@ -682,17 +686,41 @@ sealed class BrowserForm : Form
 
     // ---------- Keyboard ----------
 
-    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData) =>
+        HandleShortcut(keyData) || base.ProcessCmdKey(ref msg, keyData);
+
+    /// <summary>
+    /// While a page has focus, key presses go to the browser engine rather than to this window, so
+    /// shortcuts are also picked up from the engine's accelerator-key event. The WinForms control
+    /// keeps its controller private; it is the only way to reach that event.
+    /// </summary>
+    void HookAccelerators(WebView2 view)
+    {
+        var field = typeof(WebView2).GetField("_coreWebView2Controller", BindingFlags.NonPublic | BindingFlags.Instance);
+        if (field?.GetValue(view) is not CoreWebView2Controller controller) return;
+        controller.AcceleratorKeyPressed += (_, e) =>
+        {
+            if (e.Handled || e.KeyEventKind is not (CoreWebView2KeyEventKind.KeyDown or CoreWebView2KeyEventKind.SystemKeyDown))
+                return;
+            if (HandleShortcut((Keys)e.VirtualKey | ModifierKeys)) e.Handled = true;
+        };
+    }
+
+    bool HandleShortcut(Keys keyData)
     {
         switch (keyData)
         {
             case Keys.Control | Keys.T: NewTab(_settings.HomePage, editAddress: true); return true;
-            case Keys.Control | Keys.W: if (_active is not null) CloseTab(_active); return true;
+            case Keys.Control | Keys.W:
+            case Keys.Control | Keys.F4: if (_active is not null) CloseTab(_active); return true;
+            case Keys.Control | Keys.Shift | Keys.T: ReopenClosedTab(); return true;
             case Keys.Control | Keys.L:
             case Keys.Alt | Keys.D:
             case Keys.F6: _address.BeginEdit(); return true;
-            case Keys.Control | Keys.Tab: CycleTab(1); return true;
-            case Keys.Control | Keys.Shift | Keys.Tab: CycleTab(-1); return true;
+            case Keys.Control | Keys.Tab:
+            case Keys.Control | Keys.PageDown: CycleTab(1); return true;
+            case Keys.Control | Keys.Shift | Keys.Tab:
+            case Keys.Control | Keys.PageUp: CycleTab(-1); return true;
             case Keys.F5:
             case Keys.Control | Keys.R: _active?.View?.Reload(); return true;
             case Keys.Alt | Keys.Left: _back.PerformClick(); return true;
@@ -705,7 +733,65 @@ sealed class BrowserForm : Form
             Activate(n == 8 ? _tabs[^1] : _tabs[Math.Min(n, _tabs.Count - 1)]);
             return true;
         }
-        return base.ProcessCmdKey(ref msg, keyData);
+        return false;
+    }
+
+    void ReopenClosedTab()
+    {
+        if (_closedTabs.Count == 0) return;
+        var (url, index) = _closedTabs.Pop();
+        NewTab(url, index: Math.Min(index, _tabs.Count));
+    }
+
+    // ---------- Ctrl + mouse wheel switches tabs ----------
+
+    // A low-level mouse hook sees the wheel before the page does, including over iframes, video
+    // players and PDFs, which an in-page script would miss.
+    delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct MSLLHOOKSTRUCT { public Point pt; public int mouseData, flags, time; public IntPtr extra; }
+
+    [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetWindowsHookEx(int id, HookProc proc, IntPtr hMod, uint threadId);
+    [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hook);
+    [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(Point p);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+    [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string? name);
+    [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
+
+    const int WH_MOUSE_LL = 14, WM_MOUSEWHEEL = 0x020A;
+    HookProc? _wheelProc;
+    IntPtr _wheelHook;
+    int _wheelAccumulated;
+
+    void InstallWheelHook()
+    {
+        _wheelProc = WheelHook;
+        _wheelHook = SetWindowsHookEx(WH_MOUSE_LL, _wheelProc, GetModuleHandle(null), 0);
+    }
+
+    IntPtr WheelHook(int code, IntPtr wParam, IntPtr lParam)
+    {
+        // Keys typed into a page go to the engine's process, so this thread's keyboard state may not
+        // know Ctrl is down; ask for the physical key state instead.
+        if (code >= 0 && (int)wParam == WM_MOUSEWHEEL && (GetAsyncKeyState(0x11 /* VK_CONTROL */) & 0x8000) != 0)
+        {
+            var info = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+            if (ActiveForm == this && GetAncestor(WindowFromPoint(info.pt), 2 /* GA_ROOT */) == Handle)
+            {
+                // Touchpads send many small deltas; switch once per full notch (120).
+                _wheelAccumulated += (short)(info.mouseData >> 16);
+                while (Math.Abs(_wheelAccumulated) >= 120)
+                {
+                    int dir = _wheelAccumulated > 0 ? -1 : 1; // wheel up = previous tab
+                    _wheelAccumulated -= Math.Sign(_wheelAccumulated) * 120;
+                    BeginInvoke(() => CycleTab(dir));
+                }
+                return 1; // swallow it, so the page doesn't zoom
+            }
+        }
+        return CallNextHookEx(_wheelHook, code, wParam, lParam);
     }
 
     void CycleTab(int delta)
@@ -738,6 +824,7 @@ sealed class BrowserForm : Form
         if (disposing)
         {
             Theme.Changed -= ApplyTheme;
+            if (_wheelHook != IntPtr.Zero) UnhookWindowsHookEx(_wheelHook);
             _progressTimer.Dispose();
             _adblock.Dispose();
         }

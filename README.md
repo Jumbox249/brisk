@@ -38,13 +38,20 @@ The per-site switch controls the main blocker. The DNS layer applies to every si
 
 | Shortcut | Action |
 |---|---|
-| Ctrl+T / Ctrl+W | New tab / close tab |
-| Ctrl+L, Alt+D, F6 | Focus the address bar |
+| Ctrl+T | New tab |
+| Ctrl+W, Ctrl+F4 | Close tab |
+| Ctrl+Shift+T | Reopen the last closed tab |
+| **Ctrl+scroll wheel** | Previous tab (scroll up) / next tab (scroll down) |
 | Ctrl+Tab / Ctrl+Shift+Tab | Next / previous tab |
-| Ctrl+1 … Ctrl+9 | Jump to a tab |
+| Ctrl+PageDown / Ctrl+PageUp | Next / previous tab |
+| Ctrl+1 … Ctrl+8, Ctrl+9 | Jump to a tab / the last tab |
+| Ctrl+L, Alt+D, F6 | Focus the address bar |
 | F5, Ctrl+R | Reload |
 | Alt+← / Alt+→ | Back / forward |
+| F11 | Full screen |
 | Middle-click a tab | Close it |
+
+Shortcuts work whether the address bar or the page has focus. Because Ctrl+scroll switches tabs, use Ctrl+plus and Ctrl+minus to zoom.
 
 ## Requirements
 
