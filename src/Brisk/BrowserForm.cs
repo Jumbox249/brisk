@@ -743,10 +743,10 @@ sealed class BrowserForm : Form
         NewTab(url, index: Math.Min(index, _tabs.Count));
     }
 
-    // ---------- Ctrl + mouse wheel switches tabs ----------
+    // ---------- Alt + mouse wheel switches tabs ----------
 
     // A low-level mouse hook sees the wheel before the page does, including over iframes, video
-    // players and PDFs, which an in-page script would miss.
+    // players and PDFs, which an in-page script would miss. Ctrl + wheel is left alone for zooming.
     delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -759,11 +759,13 @@ sealed class BrowserForm : Form
     [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
     [DllImport("kernel32.dll")] static extern IntPtr GetModuleHandle(string? name);
     [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
+    [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, IntPtr extra);
 
-    const int WH_MOUSE_LL = 14, WM_MOUSEWHEEL = 0x020A;
+    const int WH_MOUSE_LL = 14, WM_MOUSEWHEEL = 0x020A, VK_MENU = 0x12;
     HookProc? _wheelProc;
     IntPtr _wheelHook;
     int _wheelAccumulated;
+    bool _altMasked;
 
     void InstallWheelHook()
     {
@@ -774,12 +776,23 @@ sealed class BrowserForm : Form
     IntPtr WheelHook(int code, IntPtr wParam, IntPtr lParam)
     {
         // Keys typed into a page go to the engine's process, so this thread's keyboard state may not
-        // know Ctrl is down; ask for the physical key state instead.
-        if (code >= 0 && (int)wParam == WM_MOUSEWHEEL && (GetAsyncKeyState(0x11 /* VK_CONTROL */) & 0x8000) != 0)
+        // know Alt is down; ask for the physical key state instead.
+        bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+        if (!alt) _altMasked = false;
+        if (code >= 0 && (int)wParam == WM_MOUSEWHEEL && alt)
         {
             var info = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
             if (ActiveForm == this && GetAncestor(WindowFromPoint(info.pt), 2 /* GA_ROOT */) == Handle)
             {
+                if (!_altMasked)
+                {
+                    // Releasing Alt on its own would put the window into menu mode and steal
+                    // keyboard focus from the page. A harmless unassigned key press in between
+                    // (VK 0xE8) tells Windows the Alt press was part of a combination.
+                    keybd_event(0xE8, 0, 0, IntPtr.Zero);
+                    keybd_event(0xE8, 0, 2 /* KEYUP */, IntPtr.Zero);
+                    _altMasked = true;
+                }
                 // Touchpads send many small deltas; switch once per full notch (120).
                 _wheelAccumulated += (short)(info.mouseData >> 16);
                 while (Math.Abs(_wheelAccumulated) >= 120)
@@ -788,7 +801,7 @@ sealed class BrowserForm : Form
                     _wheelAccumulated -= Math.Sign(_wheelAccumulated) * 120;
                     BeginInvoke(() => CycleTab(dir));
                 }
-                return 1; // swallow it, so the page doesn't zoom
+                return 1; // swallow it so the page doesn't also scroll
             }
         }
         return CallNextHookEx(_wheelHook, code, wParam, lParam);
