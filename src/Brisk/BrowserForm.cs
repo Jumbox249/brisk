@@ -64,8 +64,11 @@ sealed class BrowserForm : Form
     DnsHealth? _dnsHealth;
     (bool On, string Server) _appliedDns;
 
-    public BrowserForm()
+    readonly IReadOnlyList<string> _startUrls;
+
+    public BrowserForm(IReadOnlyList<string>? startUrls = null)
     {
+        _startUrls = startUrls ?? [];
         Text = "Brisk";
         AutoScaleMode = AutoScaleMode.None;
         Size = new Size(LogicalToDeviceUnits(1280), LogicalToDeviceUnits(820));
@@ -117,6 +120,7 @@ sealed class BrowserForm : Form
     protected override void OnLoad(EventArgs e)
     {
         base.OnLoad(e);
+        DefaultBrowser.RefreshIfMoved();
         InstallWheelHook();
         RestoreSession();
         _ = RefreshScriptletsAsync();
@@ -765,6 +769,14 @@ sealed class BrowserForm : Form
         }
 
         _menuStrip.Items.Add(new ToolStripSeparator());
+        if (DefaultBrowser.IsDefault())
+            _menuStrip.Items.Add(new ToolStripMenuItem("Brisk Is Your Default Browser") { Enabled = false });
+        else
+            _menuStrip.Items.Add("Make Brisk Your Default Browser…", null, (_, _) =>
+            {
+                DefaultBrowser.Register();
+                DefaultBrowser.OpenSettings();
+            });
         _menuStrip.Items.Add("About Brisk", null, (_, _) => { using var about = new AboutForm(Icon); about.ShowDialog(this); });
         var size = _menuStrip.GetPreferredSize(Size.Empty);
         _menuStrip.Show(_menu, new Point(_menu.Width - size.Width, _menu.Height + LogicalToDeviceUnits(6)));
@@ -925,9 +937,20 @@ sealed class BrowserForm : Form
     void RestoreSession()
     {
         var urls = _settings.SessionTabs.Where(u => !string.IsNullOrWhiteSpace(u)).ToList();
-        if (urls.Count == 0) { NewTab(_settings.HomePage); return; }
         foreach (var u in urls) NewTab(u, activate: false);
-        Activate(_tabs[Math.Clamp(_settings.SessionActiveTab, 0, _tabs.Count - 1)]);
+        // Links Brisk was started with (e.g. clicked in another app) open after the restored tabs.
+        foreach (var u in _startUrls) NewTab(u);
+        if (_tabs.Count == 0) NewTab(_settings.HomePage);
+        else if (_startUrls.Count == 0) Activate(_tabs[Math.Clamp(_settings.SessionActiveTab, 0, _tabs.Count - 1)]);
+    }
+
+    /// <summary>Called when Brisk is launched again while running: opens the links and comes to the front.</summary>
+    public void OpenFromOutside(IEnumerable<string> urls)
+    {
+        foreach (var u in urls) NewTab(u);
+        if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+        Activate();
+        BringToFront();
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)

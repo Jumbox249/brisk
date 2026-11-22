@@ -61,6 +61,12 @@ The per-site switch controls the main blocker. The DNS layer applies to every si
 
 Shortcuts work whether the address bar or the page has focus. Ctrl+scroll wheel zooms, as in other browsers.
 
+## Making Brisk your default browser
+
+Open **⋯ → Make Brisk Your Default Browser…**. Brisk registers itself with Windows for web links and `.html` files, then opens its page in **Settings → Apps → Default apps**, where you choose **Set default**. Windows requires that last step to be done by you.
+
+Links from other apps open as new tabs in the Brisk window you already have open. If Brisk isn't running, it starts with the link in front and your other tabs restored behind it.
+
 ## Requirements
 
 - Windows 10 or 11 (64-bit)
