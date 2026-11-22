@@ -4,3 +4,4 @@ dist/
 target/
 *.user
 .vs/
+assets/preview.png

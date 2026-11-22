@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.Web.WebView2.Core;
@@ -8,15 +9,17 @@ namespace Brisk;
 
 sealed class BrowserTab
 {
-    public required TabChip Chip;
     public WebView2? View;
     public Task? Ready;
     public string Url = "";
-    public string Title = "New tab";
+    public string Title = "New Tab";
+    public Image? Favicon;
     /// <summary>Top-level page URL, used as the source when matching subresource requests.</summary>
     public string PageUrl = "";
     public bool AdblockOn = true;
     public int Blocked;
+    public bool Loading;
+    public float Progress;
 }
 
 sealed class BrowserForm : Form
@@ -30,6 +33,9 @@ sealed class BrowserForm : Form
         "mc_eid", "mc_cid", "_hsenc", "_hsmi", "mkt_tok", "oly_anon_id", "oly_enc_id", "vero_id",
     ];
 
+    // Logical (96-dpi) sizes of the window chrome.
+    const int ToolbarHeight = 52, TabBarHeight = 32, CaptionWidth = 46;
+
     readonly Settings _settings = Settings.Load();
     readonly AdBlocker _adblock;
     readonly Task<CoreWebView2Environment> _env;
@@ -37,98 +43,198 @@ sealed class BrowserForm : Form
     BrowserTab? _active;
 
     readonly ToolTip _tips = new();
-    readonly Panel _strip = new() { Dock = DockStyle.Fill, BackColor = Theme.Strip };
-    readonly IconButton _newTab;
-    readonly IconButton _back, _forward, _reload, _menu;
-    readonly TextBox _address = new()
-    {
-        BorderStyle = BorderStyle.None,
-        Font = new Font("Segoe UI", 10.5f),
-        BackColor = Color.White,
-        ForeColor = Theme.Text,
-    };
-    readonly Panel _addressBox = new() { BackColor = Color.White };
+    readonly DragPanel _toolbar = new();
+    readonly GlyphButton _back, _forward, _newTab, _menu;
     readonly ShieldButton _shield = new();
-    readonly Panel _content = new() { Dock = DockStyle.Fill, BackColor = Color.White };
-    readonly TableLayoutPanel _layout;
-    readonly ContextMenuStrip _menuStrip = new();
+    readonly AddressField _address;
+    readonly CaptionButton _min = new(CaptionButton.Kind.Minimize);
+    readonly CaptionButton _max = new(CaptionButton.Kind.Maximize);
+    readonly CaptionButton _close = new(CaptionButton.Kind.Close);
+    readonly TabBar _tabBar;
+    readonly Panel _separator = new();
+    readonly Panel _content = new() { BackColor = Color.White };
+    readonly MacMenu _menuStrip = new();
+    readonly System.Windows.Forms.Timer _progressTimer = new() { Interval = 16 };
 
     bool _fullscreen;
     FormWindowState _preFullscreenState;
+    bool _dnsChangePending;
 
     public BrowserForm()
     {
         Text = "Brisk";
-        BackColor = Theme.Toolbar;
         AutoScaleMode = AutoScaleMode.None;
         Size = new Size(LogicalToDeviceUnits(1280), LogicalToDeviceUnits(820));
+        MinimumSize = new Size(LogicalToDeviceUnits(520), LogicalToDeviceUnits(360));
         StartPosition = FormStartPosition.CenterScreen;
-        KeyPreview = true;
-        try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch (ArgumentException) { }
+        Font = Theme.Ui(9f);
+        Icon = LoadIcon();
 
         _adblock = new AdBlocker(SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext());
         _adblock.Updated += msg => { if (msg.StartsWith("Couldn't")) _tips.Show(msg, _shield, 0, _shield.Height, 4000); };
         _adblock.Start();
         _env = CreateEnvironment();
 
-        _newTab = new IconButton("", "New tab (Ctrl+T)", _tips);
-        _back = new IconButton("", "Back (Alt+Left)", _tips);
-        _forward = new IconButton("", "Forward (Alt+Right)", _tips);
-        _reload = new IconButton("", "Reload (F5)", _tips);
-        _menu = new IconButton("", "Menu", _tips);
+        _back = new GlyphButton(Glyphs.Back, "Back (Alt+Left)", _tips) { GlyphSize = 18 };
+        _forward = new GlyphButton(Glyphs.Forward, "Forward (Alt+Right)", _tips) { GlyphSize = 18 };
+        _newTab = new GlyphButton(Glyphs.Plus, "New Tab (Ctrl+T)", _tips) { GlyphSize = 15 };
+        _menu = new GlyphButton(Glyphs.Ellipsis, "More", _tips) { GlyphSize = 17 };
+        _address = new AddressField(_tips);
+        _tabBar = new TabBar(_tips);
 
-        _newTab.Click += (_, _) => NewTab(_settings.HomePage, focusAddress: true);
         _back.Click += (_, _) => { if (_active?.View?.CanGoBack == true) _active.View.GoBack(); };
         _forward.Click += (_, _) => { if (_active?.View?.CanGoForward == true) _active.View.GoForward(); };
-        _reload.Click += (_, _) => _active?.View?.Reload();
+        _newTab.Click += (_, _) => NewTab(_settings.HomePage, editAddress: true);
         _menu.Click += (_, _) => ShowMenu();
         _shield.Click += (_, _) => ToggleAdblockForSite();
-        _tips.SetToolTip(_shield, "Ad blocking for this site — click to turn off or on");
-
-        _address.KeyDown += (_, e) =>
+        _tips.SetToolTip(_shield, "Ad blocking for this site. Click to turn it off or on.");
+        _address.Submitted += Go;
+        _address.ReloadClicked += () =>
         {
-            if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; Go(_address.Text); }
-            else if (e.KeyCode == Keys.Escape) { e.SuppressKeyPress = true; ShowAddress(); _active?.View?.Focus(); }
+            if (_active?.View is not { } v) return;
+            if (_active.Loading) v.Stop(); else v.Reload();
         };
-        // Clicking into the address bar selects the whole URL, like other browsers.
-        _address.Enter += (_, _) => { _selectOnClick = true; BeginInvoke(_address.SelectAll); };
-        _address.MouseUp += (_, _) => { if (_selectOnClick && _address.SelectionLength == 0) _address.SelectAll(); _selectOnClick = false; };
-        _addressBox.Controls.Add(_address);
-        _addressBox.Resize += (_, _) => LayoutAddress();
-        _addressBox.Paint += (_, e) =>
-        {
-            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            e.Graphics.Clear(Theme.Toolbar);
-            using var b = new SolidBrush(Color.White);
-            using var pen = new Pen(_address.Focused ? Color.FromArgb(0, 103, 192) : Color.FromArgb(214, 214, 220));
-            using var path = IconButton.Rounded(_addressBox.ClientRectangle, LogicalToDeviceUnits(8));
-            e.Graphics.FillPath(b, path);
-            e.Graphics.DrawPath(pen, path);
-        };
-        _address.GotFocus += (_, _) => _addressBox.Invalidate();
-        _address.LostFocus += (_, _) => _addressBox.Invalidate();
+        _min.Click += (_, _) => WindowState = FormWindowState.Minimized;
+        _max.Click += (_, _) => WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized;
+        _close.Click += (_, _) => Close();
+        _tabBar.TabSelected += Activate;
+        _tabBar.TabClosed += CloseTab;
 
-        _strip.Controls.Add(_newTab);
-        _strip.Resize += (_, _) => LayoutTabs();
+        foreach (var c in new Control[] { _back, _forward, _shield, _address, _newTab, _menu, _min, _max, _close })
+            _toolbar.Controls.Add(c);
+        Controls.AddRange([_toolbar, _tabBar, _separator, _content]);
 
-        var toolbar = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Toolbar };
-        foreach (var c in new Control[] { _back, _forward, _reload, _addressBox, _shield, _menu }) toolbar.Controls.Add(c);
-        toolbar.Resize += (_, _) => LayoutToolbar(toolbar);
-
-        _layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Margin = Padding.Empty };
-        _layout.RowStyles.Add(new RowStyle(SizeType.Absolute, LogicalToDeviceUnits(38)));
-        _layout.RowStyles.Add(new RowStyle(SizeType.Absolute, LogicalToDeviceUnits(44)));
-        _layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        foreach (var c in new Control[] { _strip, toolbar, _content }) { c.Margin = Padding.Empty; _layout.Controls.Add(c); }
-        Controls.Add(_layout);
+        _progressTimer.Tick += (_, _) => AnimateProgress();
+        Theme.Changed += ApplyTheme;
+        ApplyTheme();
     }
-
-    bool _selectOnClick;
 
     protected override void OnLoad(EventArgs e)
     {
         base.OnLoad(e);
         RestoreSession();
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        Native.StyleWindow(Handle, Theme.Current.Dark);
+        // Recompute the frame now that WM_NCCALCSIZE removes the title bar.
+        SetWindowPos(Handle, IntPtr.Zero, 0, 0, 0, 0, 0x0027 /* NOSIZE|NOMOVE|NOZORDER|FRAMECHANGED */);
+    }
+
+    void ApplyTheme()
+    {
+        var t = Theme.Current;
+        BackColor = t.Toolbar;
+        _toolbar.BackColor = t.Toolbar;
+        _separator.BackColor = t.Separator;
+        if (IsHandleCreated) Native.StyleWindow(Handle, t.Dark);
+        foreach (Control c in _toolbar.Controls) c.Invalidate();
+        _tabBar.Invalidate();
+    }
+
+    static Icon? LoadIcon()
+    {
+        using var s = Assembly.GetExecutingAssembly().GetManifestResourceStream("brisk.ico");
+        return s is null ? null : new Icon(s);
+    }
+
+    // ---------- Custom window frame ----------
+
+    [DllImport("user32.dll")]
+    static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == Native.WM_NCCALCSIZE && m.WParam != IntPtr.Zero)
+        {
+            // Let Windows compute the normal frame, then reclaim the title bar so the toolbar sits at
+            // the very top. Keeping the side/bottom frame preserves resizing, snapping and the shadow.
+            var before = Marshal.PtrToStructure<Native.RECT>(m.LParam);
+            base.WndProc(ref m);
+            var after = Marshal.PtrToStructure<Native.RECT>(m.LParam);
+            after.Top = WindowState == FormWindowState.Maximized && !_fullscreen
+                ? before.Top + (after.Left - before.Left)
+                : before.Top;
+            Marshal.StructureToPtr(after, m.LParam, false);
+            m.Result = IntPtr.Zero;
+            return;
+        }
+        if (m.Msg == Native.WM_NCHITTEST)
+        {
+            base.WndProc(ref m);
+            if ((int)m.Result == Native.HTCLIENT)
+            {
+                var p = PointToClient(new Point(unchecked((short)(long)m.LParam), unchecked((short)((long)m.LParam >> 16))));
+                int edge = LogicalToDeviceUnits(6);
+                if (WindowState == FormWindowState.Normal && p.Y < edge)
+                    m.Result = p.X < edge * 2 ? Native.HTTOPLEFT : p.X > Width - edge * 2 ? Native.HTTOPRIGHT : Native.HTTOP;
+                else if (!_fullscreen && p.Y < _toolbar.Bottom)
+                    m.Result = Native.HTCAPTION;
+            }
+            return;
+        }
+        base.WndProc(ref m);
+    }
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        _max.Invalidate();
+    }
+
+    protected override void OnActivated(EventArgs e) { base.OnActivated(e); InvalidateCaption(); }
+    protected override void OnDeactivate(EventArgs e) { base.OnDeactivate(e); InvalidateCaption(); }
+
+    void InvalidateCaption() { _min.Invalidate(); _max.Invalidate(); _close.Invalidate(); }
+
+    protected override void OnLayout(LayoutEventArgs e)
+    {
+        base.OnLayout(e);
+        if (_tabBar is null) return;
+        var cs = ClientSize;
+        int toolbarH = _fullscreen ? 0 : LogicalToDeviceUnits(ToolbarHeight);
+        int tabsH = _fullscreen || _tabs.Count < 2 ? 0 : LogicalToDeviceUnits(TabBarHeight);
+        int sepH = _fullscreen ? 0 : 1;
+        _toolbar.SetBounds(0, 0, cs.Width, toolbarH);
+        _tabBar.SetBounds(0, toolbarH, cs.Width, tabsH);
+        _tabBar.Visible = tabsH > 0;
+        _separator.SetBounds(0, toolbarH + tabsH, cs.Width, sepH);
+        int top = toolbarH + tabsH + sepH;
+        _content.SetBounds(0, top, cs.Width, Math.Max(0, cs.Height - top));
+        LayoutToolbar();
+    }
+
+    void LayoutToolbar()
+    {
+        int w = _toolbar.Width, h = _toolbar.Height;
+        if (h == 0) return;
+        int D(int v) => LogicalToDeviceUnits(v);
+        int btn = D(30), y = (h - btn) / 2;
+
+        int capW = D(CaptionWidth);
+        _close.SetBounds(w - capW, 0, capW, h);
+        _max.SetBounds(w - capW * 2, 0, capW, h);
+        _min.SetBounds(w - capW * 3, 0, capW, h);
+
+        int x = D(14);
+        _back.SetBounds(x, y, btn, btn); x += btn + D(2);
+        _forward.SetBounds(x, y, btn, btn); x += btn + D(8);
+        int shieldW = D(58);
+        _shield.SetBounds(x, y, shieldW, btn); x += shieldW;
+        int leftEdge = x + D(12);
+
+        int right = w - capW * 3 - D(10);
+        _menu.SetBounds(right - btn, y, btn, btn);
+        _newTab.SetBounds(right - btn * 2 - D(2), y, btn, btn);
+        int rightEdge = _newTab.Left - D(12);
+
+        // Centre the field in the window when there is room, like Safari.
+        int fieldH = D(34), maxW = D(680);
+        int fieldW = Math.Max(0, Math.Min(maxW, rightEdge - leftEdge));
+        int fx = Math.Clamp((w - fieldW) / 2, leftEdge, Math.Max(leftEdge, rightEdge - fieldW));
+        _address.SetBounds(fx, (h - fieldH) / 2, fieldW, fieldH);
     }
 
     // ---------- Engine ----------
@@ -179,19 +285,15 @@ sealed class BrowserForm : Form
 
     // ---------- Tabs ----------
 
-    BrowserTab NewTab(string url, bool activate = true, bool focusAddress = false, int? index = null)
+    BrowserTab NewTab(string url, bool activate = true, bool editAddress = false, int? index = null)
     {
-        var chip = new TabChip();
-        var tab = new BrowserTab { Chip = chip, Url = url, Title = TitleFor(url) };
-        chip.SetTitle(tab.Title);
-        chip.Click += (_, _) => Activate(tab);
-        chip.CloseClicked += () => CloseTab(tab);
-        _tips.SetToolTip(chip, tab.Title);
+        var tab = new BrowserTab { Url = url, Title = TitleFor(url) };
         _tabs.Insert(index ?? _tabs.Count, tab);
-        _strip.Controls.Add(chip);
-        LayoutTabs();
+        _tabBar.Tabs = _tabs;
         if (activate) Activate(tab);
-        if (focusAddress) { _address.Focus(); _address.SelectAll(); }
+        PerformLayout();
+        _tabBar.Invalidate();
+        if (editAddress) _address.BeginEdit();
         return tab;
     }
 
@@ -200,7 +302,7 @@ sealed class BrowserForm : Form
         if (_active == tab) return;
         var previous = _active;
         _active = tab;
-        foreach (var t in _tabs) t.Chip.Active = t == tab;
+        _tabBar.Active = tab;
 
         // Tabs are created lazily: a restored tab costs nothing until it is first shown.
         if (tab.View is null) _ = EnsureView(tab, navigate: true);
@@ -208,8 +310,9 @@ sealed class BrowserForm : Form
         if (previous?.View is not null) previous.View.Visible = false;
 
         tab.View?.BringToFront();
+        _tabBar.Invalidate();
         UpdateChrome();
-        if (!_address.Focused) tab.View?.Focus();
+        if (!_address.Editing) tab.View?.Focus();
     }
 
     void CloseTab(BrowserTab tab)
@@ -218,22 +321,27 @@ sealed class BrowserForm : Form
         if (i < 0) return;
         if (_tabs.Count == 1) { Close(); return; }
         _tabs.RemoveAt(i);
-        _strip.Controls.Remove(tab.Chip);
-        tab.Chip.Dispose();
         if (_active == tab)
         {
             _active = null;
             Activate(_tabs[Math.Min(i, _tabs.Count - 1)]);
         }
         tab.View?.Dispose();
-        LayoutTabs();
+        tab.Favicon?.Dispose();
+        PerformLayout();
+        _tabBar.Invalidate();
     }
 
     async Task EnsureView(BrowserTab tab, bool navigate)
     {
         if (tab.View is null)
         {
-            var view = new WebView2 { Dock = DockStyle.Fill, DefaultBackgroundColor = Color.White, Visible = tab == _active };
+            var view = new WebView2
+            {
+                Dock = DockStyle.Fill,
+                DefaultBackgroundColor = Theme.Current.Dark ? Color.FromArgb(30, 30, 30) : Color.White,
+                Visible = tab == _active,
+            };
             tab.View = view;
             _content.Controls.Add(view);
             _ = view.Handle;
@@ -252,7 +360,7 @@ sealed class BrowserForm : Form
         s.IsPasswordAutosaveEnabled = false;
         s.IsGeneralAutofillEnabled = false;
         s.IsReputationCheckingRequired = false; // SmartScreen sends visited URLs to Microsoft.
-        s.AreBrowserAcceleratorKeysEnabled = true;
+        s.IsStatusBarEnabled = true;
         core.Profile.PreferredTrackingPreventionLevel = CoreWebView2TrackingPreventionLevel.Strict;
 
         await core.AddScriptToExecuteOnDocumentCreatedAsync(CosmeticScript);
@@ -261,14 +369,40 @@ sealed class BrowserForm : Form
         core.WebResourceRequested += (_, e) => OnResourceRequested(tab, env, e);
         core.WebMessageReceived += (_, e) => OnWebMessage(tab, core, e);
         core.NavigationStarting += (_, e) => OnNavigationStarting(tab, core, e);
+        core.ContentLoading += (_, _) => { tab.Progress = Math.Max(tab.Progress, 0.45f); };
+        core.NavigationCompleted += (_, _) =>
+        {
+            tab.Loading = false;
+            tab.Progress = 1;
+            if (tab == _active) UpdateChrome();
+        };
         core.SourceChanged += (_, _) => { tab.Url = core.Source; if (tab == _active) UpdateChrome(); };
         core.HistoryChanged += (_, _) => { if (tab == _active) UpdateChrome(); };
         core.DocumentTitleChanged += (_, _) =>
         {
             tab.Title = string.IsNullOrWhiteSpace(core.DocumentTitle) ? TitleFor(core.Source) : core.DocumentTitle;
-            tab.Chip.SetTitle(tab.Title);
-            _tips.SetToolTip(tab.Chip, tab.Title);
+            _tabBar.Invalidate();
             if (tab == _active) Text = tab.Title + " — Brisk";
+        };
+        core.FaviconChanged += async (_, _) =>
+        {
+            Image? icon = null;
+            try
+            {
+                if (!string.IsNullOrEmpty(core.FaviconUri))
+                {
+                    using var stream = await core.GetFaviconAsync(CoreWebView2FaviconImageFormat.Png);
+                    if (stream is not null && stream.Length > 0)
+                    {
+                        using var img = Image.FromStream(stream);
+                        icon = new Bitmap(img);
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is ArgumentException or COMException or InvalidOperationException) { }
+            tab.Favicon?.Dispose();
+            tab.Favicon = icon;
+            _tabBar.Invalidate();
         };
         core.NewWindowRequested += async (_, e) =>
         {
@@ -304,7 +438,13 @@ sealed class BrowserForm : Form
         tab.PageUrl = e.Uri;
         tab.AdblockOn = _settings.IsAdblockEnabledFor(uri);
         tab.Blocked = 0;
-        if (tab == _active) UpdateShield();
+        tab.Loading = true;
+        tab.Progress = 0.08f;
+        if (tab == _active)
+        {
+            UpdateChrome();
+            _progressTimer.Start();
+        }
     }
 
     void OnResourceRequested(BrowserTab tab, CoreWebView2Environment env, CoreWebView2WebResourceRequestedEventArgs e)
@@ -402,14 +542,14 @@ sealed class BrowserForm : Form
     void UpdateChrome()
     {
         if (_active is null) return;
-        if (!_address.Focused) ShowAddress();
+        _address.SetUrl(_active.Url);
+        _address.Loading = _active.Loading;
         _back.Enabled = _active.View?.CanGoBack == true;
         _forward.Enabled = _active.View?.CanGoForward == true;
         Text = _active.Title + " — Brisk";
         UpdateShield();
+        if (_active.Loading || _address.Progress > 0) _progressTimer.Start();
     }
-
-    void ShowAddress() => _address.Text = _active?.Url ?? "";
 
     void UpdateShield()
     {
@@ -417,11 +557,33 @@ sealed class BrowserForm : Form
         _shield.SetState(_active.AdblockOn, _active.Blocked);
     }
 
+    /// <summary>Eases the field's progress bar toward the tab's real progress, then fades it out.</summary>
+    void AnimateProgress()
+    {
+        if (_active is null) { _progressTimer.Stop(); return; }
+        var tab = _active;
+        if (tab.Loading)
+        {
+            // Creep toward 90% while waiting so the bar never looks stuck.
+            tab.Progress = Math.Min(0.9f, tab.Progress + (0.9f - tab.Progress) * 0.012f);
+            _address.Progress += (tab.Progress - _address.Progress) * 0.25f;
+        }
+        else if (_address.Progress > 0)
+        {
+            _address.Progress = _address.Progress >= 0.995f ? 0 : _address.Progress + (1 - _address.Progress) * 0.35f;
+        }
+        else
+        {
+            _progressTimer.Stop();
+        }
+    }
+
     void Go(string input)
     {
         var url = ToUrl(input);
         if (_active is null) { NewTab(url); return; }
         _active.Url = url;
+        _address.SetUrl(url);
         _active.View?.Focus();
         if (_active.View?.CoreWebView2 is { } core) core.Navigate(url);
         else _ = EnsureView(_active, navigate: true);
@@ -447,115 +609,75 @@ sealed class BrowserForm : Form
     }
 
     static string TitleFor(string url) =>
-        Uri.TryCreate(url, UriKind.Absolute, out var u) && u.Host.Length > 0 ? Settings.SiteKey(u) : "New tab";
+        Uri.TryCreate(url, UriKind.Absolute, out var u) && u.Host.Length > 0 ? Settings.SiteKey(u) : "New Tab";
 
     void ShowMenu()
     {
         _menuStrip.Items.Clear();
-        _menuStrip.Items.Add("New tab\tCtrl+T", null, (_, _) => NewTab(_settings.HomePage, focusAddress: true));
+        _menuStrip.Items.Add(new ToolStripMenuItem("New Tab", null, (_, _) => NewTab(_settings.HomePage, editAddress: true))
+        { ShortcutKeyDisplayString = "Ctrl+T" });
+        _menuStrip.Items.Add(new ToolStripSeparator());
 
         var site = _active is not null && Uri.TryCreate(_active.Url, UriKind.Absolute, out var u) ? Settings.SiteKey(u) : "";
         if (site.Length > 0)
         {
-            var item = new ToolStripMenuItem($"Block ads on {site}") { Checked = _active!.AdblockOn };
+            var item = new ToolStripMenuItem($"Block Ads on {site}") { Checked = _active!.AdblockOn };
             item.Click += (_, _) => ToggleAdblockForSite();
             _menuStrip.Items.Add(item);
         }
 
-        var dns = new ToolStripMenuItem("Ad-blocking DNS (AdGuard)") { Checked = _settings.DnsBlocking };
+        var dns = new ToolStripMenuItem("Ad-Blocking DNS") { Checked = _settings.DnsBlocking };
         dns.Click += (_, _) =>
         {
             _settings.DnsBlocking = !_settings.DnsBlocking;
             _settings.Save();
-            MessageBox.Show(this, "Restart Brisk for the DNS change to take effect.", "Brisk");
+            _dnsChangePending = !_dnsChangePending;
         };
         _menuStrip.Items.Add(dns);
-        _menuStrip.Items.Add("Update filter lists now", null, (_, _) => _adblock.UpdateLists());
+        if (_dnsChangePending)
+            _menuStrip.Items.Add(new ToolStripMenuItem("Restart Brisk to Apply the DNS Change") { Enabled = false });
+        _menuStrip.Items.Add("Update Filter Lists", null, (_, _) => _adblock.UpdateLists());
 
         if (_settings.AdblockDisabledSites.Count > 0)
         {
-            var allowed = new ToolStripMenuItem($"Sites with ad blocking off ({_settings.AdblockDisabledSites.Count})");
+            var allowed = new ToolStripMenuItem("Sites with Ad Blocking Off");
             foreach (var s in _settings.AdblockDisabledSites.Order())
             {
-                allowed.DropDownItems.Add($"Turn back on for {s}", null, (_, _) =>
+                allowed.DropDownItems.Add($"Turn Back On for {s}", null, (_, _) =>
                 {
                     _settings.AdblockDisabledSites.Remove(s);
                     _settings.Save();
-                    foreach (var t in _tabs.Where(t => TitleFor(t.Url) == s)) t.View?.Reload();
+                    foreach (var t in _tabs.Where(t => TitleFor(t.Url) == s)) { t.AdblockOn = true; t.View?.Reload(); }
+                    UpdateShield();
                 });
             }
             _menuStrip.Items.Add(allowed);
         }
 
         _menuStrip.Items.Add(new ToolStripSeparator());
-        _menuStrip.Items.Add("About Brisk", null, (_, _) => MessageBox.Show(this,
-            "Brisk " + Application.ProductVersion.Split('+')[0] +
-            "\nA small, fast, private browser for Windows.\n\nAd blocking: Brave's adblock-rust engine with EasyList, EasyPrivacy and Peter Lowe's list, plus AdGuard DNS.",
-            "About Brisk"));
-        _menuStrip.Show(_menu, new Point(_menu.Width - _menuStrip.PreferredSize.Width, _menu.Height));
+        _menuStrip.Items.Add("About Brisk", null, (_, _) => { using var about = new AboutForm(Icon); about.ShowDialog(this); });
+        var size = _menuStrip.GetPreferredSize(Size.Empty);
+        _menuStrip.Show(_menu, new Point(_menu.Width - size.Width, _menu.Height + LogicalToDeviceUnits(6)));
     }
 
     void SetFullscreen(bool on)
     {
         if (on == _fullscreen) return;
         _fullscreen = on;
-        SuspendLayout();
         if (on)
         {
             _preFullscreenState = WindowState;
             WindowState = FormWindowState.Normal;
             FormBorderStyle = FormBorderStyle.None;
             WindowState = FormWindowState.Maximized;
-            _layout.RowStyles[0].Height = 0;
-            _layout.RowStyles[1].Height = 0;
         }
         else
         {
             FormBorderStyle = FormBorderStyle.Sizable;
             WindowState = _preFullscreenState;
-            _layout.RowStyles[0].Height = LogicalToDeviceUnits(38);
-            _layout.RowStyles[1].Height = LogicalToDeviceUnits(44);
+            Native.StyleWindow(Handle, Theme.Current.Dark);
         }
-        ResumeLayout();
-    }
-
-    // ---------- Layout ----------
-
-    void LayoutTabs()
-    {
-        if (_strip.Width == 0) return;
-        int pad = LogicalToDeviceUnits(8), gap = LogicalToDeviceUnits(2);
-        int btn = LogicalToDeviceUnits(30);
-        int available = _strip.Width - pad * 2 - btn - gap;
-        int width = _tabs.Count == 0 ? 0 : Math.Clamp(available / _tabs.Count - gap, LogicalToDeviceUnits(48), LogicalToDeviceUnits(220));
-        int x = pad;
-        foreach (var t in _tabs)
-        {
-            t.Chip.SetBounds(x, 0, width, _strip.Height);
-            x += width + gap;
-        }
-        _newTab.SetBounds(x + gap, (_strip.Height - btn) / 2 + LogicalToDeviceUnits(2), btn, btn);
-    }
-
-    void LayoutToolbar(Panel bar)
-    {
-        int h = bar.Height, b = LogicalToDeviceUnits(32), y = (h - b) / 2, x = LogicalToDeviceUnits(8);
-        int gap = LogicalToDeviceUnits(2);
-        foreach (var c in new Control[] { _back, _forward, _reload }) { c.SetBounds(x, y, b, b); x += b + gap; }
-        int right = bar.Width - LogicalToDeviceUnits(8);
-        _menu.SetBounds(right - b, y, b, b);
-        int shieldW = LogicalToDeviceUnits(64);
-        _shield.SetBounds(right - b - gap - shieldW, y, shieldW, b);
-        int addrX = x + LogicalToDeviceUnits(6);
-        _addressBox.SetBounds(addrX, y, Math.Max(0, _shield.Left - LogicalToDeviceUnits(6) - addrX), b);
-    }
-
-    void LayoutAddress()
-    {
-        int pad = LogicalToDeviceUnits(12);
-        _address.SetBounds(pad, (_addressBox.Height - _address.PreferredHeight) / 2,
-            Math.Max(0, _addressBox.Width - pad * 2), _address.PreferredHeight);
-        _addressBox.Invalidate();
+        PerformLayout();
     }
 
     // ---------- Keyboard ----------
@@ -564,18 +686,18 @@ sealed class BrowserForm : Form
     {
         switch (keyData)
         {
-            case Keys.Control | Keys.T: NewTab(_settings.HomePage, focusAddress: true); return true;
+            case Keys.Control | Keys.T: NewTab(_settings.HomePage, editAddress: true); return true;
             case Keys.Control | Keys.W: if (_active is not null) CloseTab(_active); return true;
             case Keys.Control | Keys.L:
             case Keys.Alt | Keys.D:
-            case Keys.F6: _address.Focus(); _address.SelectAll(); return true;
+            case Keys.F6: _address.BeginEdit(); return true;
             case Keys.Control | Keys.Tab: CycleTab(1); return true;
             case Keys.Control | Keys.Shift | Keys.Tab: CycleTab(-1); return true;
             case Keys.F5:
             case Keys.Control | Keys.R: _active?.View?.Reload(); return true;
             case Keys.Alt | Keys.Left: _back.PerformClick(); return true;
             case Keys.Alt | Keys.Right: _forward.PerformClick(); return true;
-            case Keys.F11: ToggleWindowFullscreen(); return true;
+            case Keys.F11: SetFullscreen(!_fullscreen); return true;
         }
         if (keyData >= (Keys.Control | Keys.D1) && keyData <= (Keys.Control | Keys.D9) && _tabs.Count > 0)
         {
@@ -585,8 +707,6 @@ sealed class BrowserForm : Form
         }
         return base.ProcessCmdKey(ref msg, keyData);
     }
-
-    void ToggleWindowFullscreen() => SetFullscreen(!_fullscreen);
 
     void CycleTab(int delta)
     {
@@ -615,7 +735,12 @@ sealed class BrowserForm : Form
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) _adblock.Dispose();
+        if (disposing)
+        {
+            Theme.Changed -= ApplyTheme;
+            _progressTimer.Dispose();
+            _adblock.Dispose();
+        }
         base.Dispose(disposing);
     }
 

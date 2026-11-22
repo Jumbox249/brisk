@@ -17,8 +17,10 @@
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <Version>0.1.0</Version>
     <Product>Brisk</Product>
+    <ApplicationIcon>..\..\assets\brisk.ico</ApplicationIcon>
     <!-- The WebView2 package drags in its WPF assembly; Brisk only uses WinForms. -->
-    <NoWarn>$(NoWarn);MSB3277</NoWarn>
+    <!-- WFO1000 is about the WinForms designer, which this project doesn't use. -->
+    <NoWarn>$(NoWarn);MSB3277;WFO1000</NoWarn>
   </PropertyGroup>
 
   <Target Name="RemoveUnusedWebView2Files" AfterTargets="Publish">
@@ -31,6 +33,7 @@
 
   <ItemGroup>
     <EmbeddedResource Include="Assets\cosmetic.js" LogicalName="cosmetic.js" />
+    <EmbeddedResource Include="..\..\assets\brisk.ico" LogicalName="brisk.ico" />
   </ItemGroup>
 
   <!-- The Rust engine, built by build.ps1 into native/adblock-ffi/target/release. -->

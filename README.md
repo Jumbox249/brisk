@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/brisk.png" width="128" alt="Brisk icon"></p>
+
 # Brisk
 
 A small, fast, private web browser for Windows, with ad blocking built in.

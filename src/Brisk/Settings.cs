@@ -6,7 +6,9 @@ namespace Brisk;
 sealed class Settings
 {
     public static readonly string DataDir =
-        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Brisk");
+        Environment.GetEnvironmentVariable("BRISK_DATA_DIR") is { Length: > 0 } dir
+            ? dir
+            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Brisk");
 
     static readonly string FilePath = Path.Combine(DataDir, "settings.json");
 
