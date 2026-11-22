@@ -106,6 +106,7 @@ sealed class BrowserForm : Form
         Controls.AddRange([_toolbar, _tabBar, _separator, _content]);
 
         _progressTimer.Tick += (_, _) => AnimateProgress();
+        UpdatePlaceholder();
         Theme.Changed += ApplyTheme;
         ApplyTheme();
     }
@@ -612,6 +613,11 @@ sealed class BrowserForm : Form
         return _settings.SearchUrl + Uri.EscapeDataString(input);
     }
 
+    void UpdatePlaceholder() =>
+        _address.Placeholder = _settings.CurrentSearchEngine is { } e
+            ? $"Search {e.Name} or enter website name"
+            : "Search or enter website name";
+
     static string TitleFor(string url) =>
         Uri.TryCreate(url, UriKind.Absolute, out var u) && u.Host.Length > 0 ? Settings.SiteKey(u) : "New Tab";
 
@@ -641,6 +647,16 @@ sealed class BrowserForm : Form
         if (_dnsChangePending)
             _menuStrip.Items.Add(new ToolStripMenuItem("Restart Brisk to Apply the DNS Change") { Enabled = false });
         _menuStrip.Items.Add("Update Filter Lists", null, (_, _) => _adblock.UpdateLists());
+        _menuStrip.Items.Add(new ToolStripSeparator());
+
+        var engines = new ToolStripMenuItem("Search Engine");
+        foreach (var engine in Settings.SearchEngines)
+        {
+            var item = new ToolStripMenuItem(engine.Name) { Checked = _settings.CurrentSearchEngine == engine };
+            item.Click += (_, _) => { _settings.UseSearchEngine(engine); UpdatePlaceholder(); };
+            engines.DropDownItems.Add(item);
+        }
+        _menuStrip.Items.Add(engines);
 
         if (_settings.AdblockDisabledSites.Count > 0)
         {

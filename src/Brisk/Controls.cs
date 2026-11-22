@@ -365,7 +365,8 @@ sealed class DragPanel : Panel
 /// </summary>
 sealed class AddressField : ChromeControl
 {
-    readonly TextBox _box = new() { BorderStyle = BorderStyle.None, PlaceholderText = "Search or enter website name" };
+    readonly TextBox _box = new() { BorderStyle = BorderStyle.None };
+    string _placeholder = "Search or enter website name";
     readonly Font _font = Theme.Ui(10f);
     readonly GlyphButton _reload;
     string _url = "";
@@ -417,6 +418,13 @@ sealed class AddressField : ChromeControl
     {
         get => _progress;
         set { if (Math.Abs(_progress - value) > 0.001f) { _progress = value; Invalidate(); } }
+    }
+
+    /// <summary>Hint shown when the field is empty, e.g. "Search Google or enter website name".</summary>
+    public string Placeholder
+    {
+        get => _placeholder;
+        set { _placeholder = value; _box.PlaceholderText = value; Invalidate(); }
     }
 
     public void SetUrl(string url)
@@ -510,10 +518,10 @@ sealed class AddressField : ChromeControl
         }
         else
         {
-            text = _url.Length == 0 || _url.StartsWith("about:", StringComparison.Ordinal) ? "Search or enter website name" : _url;
+            text = _url.Length == 0 || _url.StartsWith("about:", StringComparison.Ordinal) ? _placeholder : _url;
         }
 
-        bool placeholder = text == "Search or enter website name";
+        bool placeholder = text == _placeholder;
         int maxText = Width - (int)Dp(80);
         var size = TextRenderer.MeasureText(g, text, _font, new Size(maxText, Height), TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
         size.Width = Math.Min(size.Width, maxText);
@@ -781,7 +789,7 @@ sealed class MacMenu : ContextMenuStrip
             dd.Renderer = Renderer;
             dd.Font = Font;
             dd.ShowImageMargin = false;
-            dd.ShowCheckMargin = false;
+            dd.ShowCheckMargin = dd.Items.OfType<ToolStripMenuItem>().Any(i => i.Checked);
             dd.DropShadowEnabled = false;
             dd.Opened += (_, _) => Native.StyleWindow(dd.Handle, Theme.Current.Dark);
             foreach (ToolStripItem child in dd.Items) Style(child);

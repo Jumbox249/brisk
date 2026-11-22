@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace Brisk;
 
@@ -26,6 +27,28 @@ sealed class Settings
     public string SearchUrl { get; set; } = "https://duckduckgo.com/?q=";
 
     public string HomePage { get; set; } = "https://duckduckgo.com/";
+
+    public static readonly SearchEngine[] SearchEngines =
+    [
+        new("DuckDuckGo", "https://duckduckgo.com/?q=", "https://duckduckgo.com/"),
+        new("Google", "https://www.google.com/search?q=", "https://www.google.com/"),
+        new("Bing", "https://www.bing.com/search?q=", "https://www.bing.com/"),
+        new("Brave Search", "https://search.brave.com/search?q=", "https://search.brave.com/"),
+        new("Startpage", "https://www.startpage.com/do/search?q=", "https://www.startpage.com/"),
+        new("Ecosia", "https://www.ecosia.org/search?q=", "https://www.ecosia.org/"),
+    ];
+
+    /// <summary>The preset matching <see cref="SearchUrl"/>, or null for a custom URL.</summary>
+    [JsonIgnore]
+    public SearchEngine? CurrentSearchEngine => SearchEngines.FirstOrDefault(e => e.SearchUrl == SearchUrl);
+
+    /// <summary>Switches search engine. The new-tab page follows it unless the user set their own.</summary>
+    public void UseSearchEngine(SearchEngine engine)
+    {
+        if (CurrentSearchEngine is { } old && HomePage == old.HomePage) HomePage = engine.HomePage;
+        SearchUrl = engine.SearchUrl;
+        Save();
+    }
 
     public List<string> SessionTabs { get; set; } = new();
 
@@ -70,3 +93,5 @@ sealed class Settings
         catch (IOException) { /* best effort */ }
     }
 }
+
+sealed record SearchEngine(string Name, string SearchUrl, string HomePage);

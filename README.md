@@ -28,7 +28,7 @@ The per-site switch controls the main blocker. The DNS layer applies to every si
 - WebRTC won't reveal your local IP address.
 - Password saving and form autofill are off.
 - SmartScreen is off, so the URLs you visit aren't sent to Microsoft for reputation checks.
-- The default search engine is DuckDuckGo.
+- The default search engine is DuckDuckGo. You can switch to Google, Bing, Brave Search, Startpage or Ecosia under **⋯ → Search Engine**.
 
 ## Other features
 
